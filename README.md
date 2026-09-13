@@ -145,7 +145,7 @@ ghcr.io/touka2014/kitsunegate:0.1
 ghcr.io/touka2014/kitsunegate:latest
 ```
 
-The workflow generates an SBOM, build provenance, and `amd64`/`arm64` manifests, then creates the matching GitHub Release with generated release notes. No Docker Hub account is required.
+The workflow generates an SBOM, build provenance, and `amd64`/`arm64` manifests, then creates the matching GitHub Release. Add curated notes at `docs/releases/<tag>.md`; when that file is absent, GitHub-generated notes are used instead. No Docker Hub account is required.
 
 After the first tagged build, open the package settings on GitHub and set the container package visibility to **Public**. This lets users pull the image without signing in to GHCR.
 
