@@ -133,7 +133,7 @@ The container build runs linting, automated tests, and the production web build 
 The included GitHub Actions workflow publishes multi-platform images to GitHub Container Registry whenever a semantic version tag is pushed:
 
 ```bash
-git tag v0.1.0
+git tag -a v0.1.0 -m "KitsuneGate v0.1.0 — First Tail"
 git push origin v0.1.0
 ```
 
@@ -145,7 +145,7 @@ ghcr.io/touka2014/kitsunegate:0.1
 ghcr.io/touka2014/kitsunegate:latest
 ```
 
-The workflow generates an SBOM, build provenance, and `amd64`/`arm64` manifests. No Docker Hub account is required.
+The workflow generates an SBOM, build provenance, and `amd64`/`arm64` manifests, then creates the matching GitHub Release with generated release notes. No Docker Hub account is required.
 
 After the first tagged build, open the package settings on GitHub and set the container package visibility to **Public**. This lets users pull the image without signing in to GHCR.
 
