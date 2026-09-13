@@ -1,0 +1,23 @@
+services:
+  kitsunegate:
+    image: ${KITSUNEGATE_IMAGE:-ghcr.io/touka2014/kitsunegate:latest}
+    build:
+      context: .
+    container_name: kitsunegate
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      KITSUNEGATE_WEB_ORIGIN: ${KITSUNEGATE_WEB_ORIGIN:-${RELAYDECK_WEB_ORIGIN:-http://localhost:8080}}
+      KITSUNEGATE_ADMIN_USER: ${KITSUNEGATE_ADMIN_USER:-${RELAYDECK_ADMIN_USER:-kitsunegate}}
+      KITSUNEGATE_ADMIN_PASSWORD: ${KITSUNEGATE_ADMIN_PASSWORD:-${RELAYDECK_ADMIN_PASSWORD:-}}
+      # Legacy names are passed only to support in-place RelayDeck upgrades.
+      RELAYDECK_WEB_ORIGIN: ${RELAYDECK_WEB_ORIGIN:-}
+      RELAYDECK_ADMIN_USER: ${RELAYDECK_ADMIN_USER:-}
+      RELAYDECK_ADMIN_PASSWORD: ${RELAYDECK_ADMIN_PASSWORD:-}
+    volumes:
+      - ./deployment-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'

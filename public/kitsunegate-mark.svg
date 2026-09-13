@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">KitsuneGate</title>
+  <desc id="desc">A fox guardian framed by a network gateway with three converging routes.</desc>
+  <defs>
+    <linearGradient id="night" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#132951"/>
+      <stop offset="1" stop-color="#081326"/>
+    </linearGradient>
+    <linearGradient id="fox" x1="146" y1="112" x2="352" y2="374" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB24A"/>
+      <stop offset="0.55" stop-color="#FF7A45"/>
+      <stop offset="1" stop-color="#F04474"/>
+    </linearGradient>
+    <linearGradient id="route" x1="256" y1="84" x2="256" y2="452" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7DE7FF"/>
+      <stop offset="1" stop-color="#2E8BFF"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#night)"/>
+  <path d="M112 344V210c0-92 58-150 144-150s144 58 144 150v134" fill="none" stroke="url(#route)" stroke-width="22" stroke-linecap="round" opacity=".9"/>
+  <path d="M139 123l88 38-69 91zM373 123l-88 38 69 91z" fill="url(#fox)"/>
+  <path d="M256 139c-73 0-126 51-126 122 0 63 42 114 126 145 84-31 126-82 126-145 0-71-53-122-126-122z" fill="url(#fox)"/>
+  <path d="M256 170c-44 35-75 68-91 111 25-14 53-22 91-22s66 8 91 22c-16-43-47-76-91-111z" fill="#FFF4E8" opacity=".98"/>
+  <path d="M179 267c24 2 44 10 61 25-31 14-55 10-72-13zM333 267c-24 2-44 10-61 25 31 14 55 10 72-13z" fill="#0A1830"/>
+  <path d="M238 322h36l-18 18z" fill="#0A1830"/>
+  <path d="M256 341v42" stroke="#FFF4E8" stroke-width="10" stroke-linecap="round"/>
+  <g fill="none" stroke="url(#route)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+    <path d="M104 423h76l38-40"/>
+    <path d="M408 423h-76l-38-40"/>
+    <path d="M256 452v-69"/>
+  </g>
+  <g fill="#A8F3FF">
+    <circle cx="96" cy="423" r="15"/>
+    <circle cx="416" cy="423" r="15"/>
+    <circle cx="256" cy="460" r="15"/>
+  </g>
+</svg>
