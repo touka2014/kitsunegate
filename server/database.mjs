@@ -3,8 +3,13 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
+import { probeOptions } from './probes.mjs';
 import { decryptSecret, encryptSecret, maskProxyUri } from './crypto.mjs';
-import { normalizeJsonConfig, normalizeManualConfig } from './node-config.mjs';
+import {
+  linkToSingBox,
+  normalizeJsonConfig,
+  normalizeManualConfig,
+} from './node-config.mjs';
 import {
   levelAllows,
   normalizeSettings,
@@ -26,6 +31,11 @@ if (!fs.existsSync(databasePath) && fs.existsSync(legacyDatabasePath)) {
   }
 }
 const db = new DatabaseSync(databasePath);
+const existingInstallation = !!db
+  .prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proxy_groups'",
+  )
+  .get();
 
 db.exec(`
   PRAGMA foreign_keys = ON;
@@ -353,7 +363,12 @@ function prepareNodeInput(input, fallbackSource = 'link') {
     };
     encryptedConfig = encryptSecret(JSON.stringify(normalized.payload));
   } else {
-    parsed = parseProxyUri(input.uri);
+    const outbound = linkToSingBox(input.uri, 'validate');
+    parsed = {
+      ...parseProxyUri(input.uri),
+      server: outbound.server,
+      serverPort: outbound.server_port,
+    };
     encryptedUri = encryptSecret(input.uri);
   }
   return {
@@ -576,7 +591,16 @@ function seedDatabase() {
   }
 }
 
-seedDatabase();
+if (!existingInstallation) {
+  db.exec('BEGIN');
+  try {
+    seedDatabase();
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
 
 // Keep built-in sample names language-neutral without overwriting groups that
 // users have renamed. These IDs and legacy names only belong to the seed data.
@@ -606,6 +630,45 @@ db.exec(`
     'node_sg1', 'node_sg2', 'node_sg3', 'node_sg4'
   ) AND server LIKE '%.example.com'
 `);
+
+// v0.1.0 accepted links it could not render and silently skipped their adapters.
+if (
+  !db
+    .prepare("SELECT 1 FROM app_settings WHERE key='validatedLegacyLinks'")
+    .get()
+) {
+  db.exec('BEGIN');
+  try {
+    for (const row of db
+      .prepare(
+        "SELECT id,group_id,encrypted_uri FROM proxy_nodes WHERE enabled=1 AND source_type='link'",
+      )
+      .all()) {
+      const uri = decryptSecret(row.encrypted_uri);
+      try {
+        linkToSingBox(uri, 'validate');
+      } catch (error) {
+        db.prepare(
+          "UPDATE proxy_nodes SET enabled=0,health_status='unknown',last_error=? WHERE id=?",
+        ).run(error.message, row.id);
+        addEvent({
+          groupId: row.group_id,
+          nodeId: row.id,
+          type: 'node.invalid',
+          severity: 'error',
+          message: 'Disabled invalid saved link: ' + error.message,
+        });
+      }
+    }
+    db.prepare(
+      "INSERT INTO app_settings(key,value,updated_at) VALUES('validatedLegacyLinks','true',?)",
+    ).run(now());
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
 
 function serializeGroup(row) {
   const nodes = db
@@ -712,14 +775,13 @@ function validateGroup(input, existingId = null) {
   const listenPort = Number(input.listenPort);
   if (!name) throw new Error('Enter a proxy group name.');
   if (!regionCode) throw new Error('Enter a region code.');
-  if (!listenHost) throw new Error('Enter a listen address.');
+  if (!/^[a-zA-Z0-9.:%_-]+$/.test(listenHost))
+    throw new Error('Invalid listen address.');
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535)
     throw new Error('Listen port must be between 1 and 65535.');
   const conflict = db
-    .prepare(
-      'SELECT id FROM proxy_groups WHERE listen_host = ? AND listen_port = ? AND id != ?',
-    )
-    .get(listenHost, listenPort, existingId ?? '');
+    .prepare('SELECT id FROM proxy_groups WHERE listen_port = ? AND id != ?')
+    .get(listenPort, existingId ?? '');
   if (conflict)
     throw new Error(
       `${listenHost}:${listenPort} is already used by another proxy group.`,
@@ -730,17 +792,7 @@ function validateGroup(input, existingId = null) {
         .map((url) => url.trim())
         .filter(Boolean)
     : ['https://www.gstatic.com/generate_204'];
-  if (!probeUrls.length) throw new Error('Keep at least one probe URL.');
-  for (const url of probeUrls) {
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      throw new Error(`Invalid probe URL: ${url}`);
-    }
-    if (!['http:', 'https:'].includes(parsed.protocol))
-      throw new Error('Probe URLs must use HTTP or HTTPS.');
-  }
+  probeOptions(probeUrls, Number(input.probeTimeout ?? 6));
   function bounded(name, value, fallback, minimum, maximum) {
     const number = Number(value ?? fallback);
     if (!Number.isInteger(number) || number < minimum || number > maximum)
@@ -1094,42 +1146,62 @@ export function addTrafficSample(groupId, metrics) {
 
 export function getTrafficTrend(range = '1h') {
   const definition = rangeDefinition(range);
-  const oldestTimestamp = new Date(
-    Date.now() - definition.seconds * 1000,
-  ).toISOString();
+  const end = Date.now(),
+    start = end - definition.seconds * 1000,
+    bucket = definition.bucketSeconds * 1000;
+  // Split intervals at bucket boundaries. A 60s sample covers twelve 5s buckets.
   const rows = db
     .prepare(`
-    WITH per_group AS (
-      SELECT
-        group_id,
-        CAST(strftime('%s', created_at) / ? AS INTEGER) * ? AS epoch,
-        AVG(bytes_in_per_second) AS bytes_in_per_second,
-        AVG(bytes_out_per_second) AS bytes_out_per_second,
-        AVG(active_connections) AS active_connections
-      FROM traffic_samples
-      WHERE created_at >= ?
-      GROUP BY group_id, epoch
+    WITH RECURSIVE samples AS (
+      SELECT group_id, bytes_in_per_second AS up, bytes_out_per_second AS down, active_connections AS connections,
+        CAST(round((julianday(created_at)-2440587.5)*86400000) AS INTEGER) AS finish, interval_ms
+      FROM traffic_samples WHERE created_at > ? AND created_at <= ? AND interval_ms > 0
+    ), spans(group_id,up,down,connections,begin,finish,epoch) AS (
+      SELECT group_id,up,down,connections,MAX(finish-interval_ms,?),finish,
+        CAST(MAX(finish-interval_ms,?) / ? AS INTEGER)*? FROM samples
+      UNION ALL
+      SELECT group_id,up,down,connections,begin,finish,epoch+? FROM spans WHERE epoch+? < finish
+    ), weights AS (
+      SELECT *, MIN(finish,epoch+?) - MAX(begin,epoch) AS ms FROM spans
+    ), per_group AS (
+      SELECT epoch,group_id,SUM(up*ms)/SUM(ms) AS up,SUM(down*ms)/SUM(ms) AS down,
+        SUM(1.0*connections*ms)/SUM(ms) AS conns FROM weights WHERE ms>0 GROUP BY epoch,group_id
     )
-    SELECT
-      epoch,
-      SUM(bytes_in_per_second) AS bytesInPerSecond,
-      SUM(bytes_out_per_second) AS bytesOutPerSecond,
-      SUM(active_connections) AS activeConnections
-    FROM per_group
-    GROUP BY epoch
-    ORDER BY epoch ASC
+    SELECT epoch,SUM(up) AS bytesInPerSecond,SUM(down) AS bytesOutPerSecond,SUM(conns) AS activeConnections
+    FROM per_group GROUP BY epoch ORDER BY epoch
   `)
-    .all(definition.bucketSeconds, definition.bucketSeconds, oldestTimestamp);
+    .all(
+      new Date(start).toISOString(),
+      new Date(end).toISOString(),
+      start,
+      start,
+      bucket,
+      bucket,
+      bucket,
+      bucket,
+      bucket,
+    );
+  const byTime = new Map(rows.map((row) => [row.epoch, row]));
+  const points = [];
+  if (rows.length)
+    for (
+      let epoch = Math.floor(start / bucket) * bucket;
+      epoch < end;
+      epoch += bucket
+    ) {
+      const row = byTime.get(epoch);
+      points.push({
+        createdAt: new Date(epoch).toISOString(),
+        bytesInPerSecond: row?.bytesInPerSecond ?? null,
+        bytesOutPerSecond: row?.bytesOutPerSecond ?? null,
+        activeConnections: row?.activeConnections ?? null,
+      });
+    }
   return {
     range: definition.key,
     label: definition.label,
     bucketSeconds: definition.bucketSeconds,
-    points: rows.map((row) => ({
-      createdAt: new Date(Number(row.epoch) * 1000).toISOString(),
-      bytesInPerSecond: Number(row.bytesInPerSecond ?? 0),
-      bytesOutPerSecond: Number(row.bytesOutPerSecond ?? 0),
-      activeConnections: Number(row.activeConnections ?? 0),
-    })),
+    points,
   };
 }
 

@@ -9,7 +9,6 @@ import {
   Braces,
   ChevronDown,
   Clipboard,
-  Code2,
   Gauge,
   LayoutDashboard,
   Languages,
@@ -149,8 +148,8 @@ type AppSettings = {
 };
 type TrafficPoint = {
   createdAt: string;
-  bytesInPerSecond: number;
-  bytesOutPerSecond: number;
+  bytesInPerSecond: number | null;
+  bytesOutPerSecond: number | null;
   activeConnections: number;
 };
 type TrafficTrend = {
@@ -251,14 +250,7 @@ type NodeDraft = {
   manual: ManualNodeConfig;
 };
 
-const API_BASE =
-  typeof window !== 'undefined' &&
-  !(
-    ['localhost', '127.0.0.1'].includes(window.location.hostname) &&
-    window.location.port === '3000'
-  )
-    ? '/api'
-    : 'http://127.0.0.1:8787/api';
+const API_BASE = '/api';
 
 const modeLabels: Record<Mode, string> = {
   load_balance: '负载均衡',
@@ -523,6 +515,15 @@ export default function KitsuneGateDashboard() {
 
   const selectedGroup =
     state?.groups.find((group) => group.id === detailId) ?? null;
+  const probeDraftChanged = Boolean(
+    groupDraft &&
+    selectedGroup &&
+    (groupDraft.probeTimeout !== selectedGroup.probeTimeout ||
+      groupDraft.riseThreshold !== selectedGroup.riseThreshold ||
+      groupDraft.fallThreshold !== selectedGroup.fallThreshold ||
+      JSON.stringify(groupDraft.probeUrls) !==
+        JSON.stringify(selectedGroup.probeUrls)),
+  );
   const allNodes = useMemo(
     () =>
       state?.groups.flatMap((group) =>
@@ -626,7 +627,7 @@ export default function KitsuneGateDashboard() {
     }
   }
 
-  async function testGroup(group: ProxyGroup) {
+  async function testGroup(group: ProxyGroup, draft?: GroupDraft) {
     setCheckTitle(`${group.name} · 真实链路检测`);
     setCheckOpen(true);
     setCheckRunning(true);
@@ -635,6 +636,14 @@ export default function KitsuneGateDashboard() {
     try {
       const report = await api<ProbeReport>(`/groups/${group.id}/test`, {
         method: 'POST',
+        body: draft
+          ? JSON.stringify({
+              draft: {
+                probeUrls: draft.probeUrls,
+                probeTimeout: draft.probeTimeout,
+              },
+            })
+          : undefined,
       });
       setCheckReports([report]);
       await loadState(true);
@@ -1122,10 +1131,15 @@ export default function KitsuneGateDashboard() {
                     <div className="grid grid-cols-2 gap-2">
                       <Button
                         variant="outline"
-                        onClick={() => void testGroup(selectedGroup)}
+                        onClick={() =>
+                          void testGroup(
+                            selectedGroup,
+                            probeDraftChanged ? groupDraft : undefined,
+                          )
+                        }
                       >
                         <Play />
-                        立即真实检测
+                        {probeDraftChanged ? '草稿试测' : '立即真实检测'}
                       </Button>
                       <Button onClick={() => void saveGroup()}>
                         <Save />
@@ -1781,8 +1795,14 @@ function OverviewDashboard({
       minute: '2-digit',
       ...(range === '30m' || range === '1h' ? { second: '2-digit' } : {}),
     }),
-    down: (point.bytesOutPerSecond * 8) / 1_000_000,
-    up: (point.bytesInPerSecond * 8) / 1_000_000,
+    down:
+      point.bytesOutPerSecond === null
+        ? null
+        : (point.bytesOutPerSecond * 8) / 1_000_000,
+    up:
+      point.bytesInPerSecond === null
+        ? null
+        : (point.bytesInPerSecond * 8) / 1_000_000,
   }));
 
   return (
@@ -2199,9 +2219,13 @@ function ProbeResultPanel({
                       result.probe.ok ? 'text-emerald-700' : 'text-rose-700',
                     )}
                   >
-                    {result.probe.ok
-                      ? `HTTP ${result.probe.statusCode} · 连续成功 ${result.successCount ?? 0} 次`
-                      : `${result.probe.error} · 连续失败 ${result.failureCount ?? 0} 次`}
+                    <span className="block break-all">{result.probe.url}</span>
+                    {result.successCount === undefined &&
+                    result.failureCount === undefined
+                      ? result.probe.error || `HTTP ${result.probe.statusCode}`
+                      : result.probe.ok
+                        ? `HTTP ${result.probe.statusCode} · 连续成功 ${result.successCount ?? 0} 次`
+                        : `${result.probe.error} · 连续失败 ${result.failureCount ?? 0} 次`}
                   </p>
                 </div>
               ))}
@@ -2424,6 +2448,10 @@ function HealthForm({
   return (
     <>
       <Field label="检测地址（每行一个）">
+        <span className="text-xs text-muted-foreground">
+          <span>可选预期 HTTP 状态码，例如</span>{' '}
+          <code>https://example.org/check 204</code>
+        </span>
         <textarea
           value={draft.probeUrls.join('\n')}
           onChange={(e) =>
@@ -3237,7 +3265,8 @@ function ConfigPreview({
   onReload: () => void;
 }) {
   const [kind, setKind] = useState<'haproxy' | 'singbox'>('haproxy');
-  const content = preview?.[kind] ?? '';
+  const activeKind = preview?.haproxy ? kind : 'singbox';
+  const content = preview?.[activeKind] ?? '';
   async function copy() {
     await navigator.clipboard.writeText(content);
     toast.add({ title: '配置已复制', type: 'success' });
@@ -3251,31 +3280,26 @@ function ConfigPreview({
     );
   return (
     <>
-      <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs leading-5 text-blue-800">
-        <Code2 className="mr-1 inline size-4" />
-        {
-          'sing-box 配置已由真实核心加载。Windows 本地版使用内置 TCP 均衡器；HAProxy 配置为后续 Linux/Docker 部署保留。'
-        }
-      </div>
       <div className="flex items-center justify-between">
         <div className="flex rounded-lg bg-slate-100 p-1">
           <button
+            disabled={!preview?.haproxy}
             onClick={() => setKind('haproxy')}
             className={cn(
               'rounded-md px-3 py-1.5 text-xs',
-              kind === 'haproxy' && 'bg-white font-medium shadow-sm',
+              activeKind === 'haproxy' && 'bg-white font-medium shadow-sm',
             )}
           >
-            HAProxy（部署预览）
+            HAProxy
           </button>
           <button
             onClick={() => setKind('singbox')}
             className={cn(
               'rounded-md px-3 py-1.5 text-xs',
-              kind === 'singbox' && 'bg-white font-medium shadow-sm',
+              activeKind === 'singbox' && 'bg-white font-medium shadow-sm',
             )}
           >
-            sing-box（当前运行）
+            sing-box
           </button>
         </div>
         <div className="flex gap-1">

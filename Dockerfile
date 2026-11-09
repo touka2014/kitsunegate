@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-RUN npm run lint && npm test && npm run build
+RUN npm run lint && npm test && KITSUNEGATE_API_SOCKET=/run/kitsunegate/api.sock npm run build
 
 FROM node:24-trixie-slim
 
@@ -45,11 +45,12 @@ ENV NODE_ENV=production \
     KITSUNEGATE_RUNTIME_DIR=/app/runtime \
     SING_BOX_BIN=/usr/local/bin/sing-box \
     HAPROXY_BIN=/usr/sbin/haproxy \
+    KITSUNEGATE_API_SOCKET=/run/kitsunegate/api.sock \
     KITSUNEGATE_BALANCER=haproxy
 
 EXPOSE 8080
 HEALTHCHECK --interval=20s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8080/healthz >/dev/null || exit 1
+  CMD curl -fsS http://127.0.0.1:8080/readyz >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "scripts/container.mjs"]

@@ -1,0 +1,22 @@
+name: Proxy isolation regression
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t kitsunegate:test .
+      - name: Keep a Japanese transfer alive during rejected US updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --name kg-test --network none -d -e KITSUNEGATE_ADMIN_PASSWORD=isolated-ci kitsunegate:test
+          trap 'docker rm -f kg-test >/dev/null' EXIT
+          for i in {1..30}; do
+            if docker exec kg-test curl -fsS http://localhost:8080/readyz; then break; fi
+            sleep 1
+          done
+          docker exec -i kg-test node --input-type=module < scripts/test-isolation.mjs

@@ -45,15 +45,15 @@ test('HAProxy fallback marks secondary nodes as backup', () => {
   assert.match(config, /server node-b 127\.0\.0\.1:12002.* backup/);
 });
 
-test('fixed mode keeps non-selected nodes as backups', () => {
+test('fixed mode never exposes another node at startup', () => {
   const config = renderHAProxyConfig([{ ...baseGroup, mode: 'fixed' }]);
+  assert.match(config, /server node-a /);
+  assert.doesNotMatch(config, /server node-b /);
   assert.doesNotMatch(
-    config.split('\n').find((line) => line.includes('node-a')),
-    /backup/,
-  );
-  assert.match(
-    config.split('\n').find((line) => line.includes('node-b')),
-    /backup/,
+    renderHAProxyConfig([
+      { ...baseGroup, mode: 'fixed', selected_node_id: null },
+    ]),
+    /server node-/,
   );
 });
 

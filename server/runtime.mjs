@@ -1,12 +1,12 @@
 import fs from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
+import { probeTarget } from './probes.mjs';
+import { alive, discard, listen, prepare } from './generation.mjs';
 import path from 'node:path';
 import tls from 'node:tls';
-import { execFile, spawn } from 'node:child_process';
-import { promisify } from 'node:util';
 
 import {
+  db,
   addRuntimeLog,
   addTrafficSample,
   cleanupMonitoringData,
@@ -16,13 +16,12 @@ import {
   getRawStateForEngine,
   recordNodeHealth,
 } from './database.mjs';
-import { renderHAProxyConfig, renderSingBoxConfig } from './engine.mjs';
+
 import {
   advanceMonotonicCounter,
   parseHAProxyActiveSessionBytes,
 } from './monitoring.mjs';
 
-const execFileAsync = promisify(execFile);
 const runtimeDirectory = path.resolve(
   process.env.KITSUNEGATE_RUNTIME_DIR ??
     process.env.RELAYDECK_RUNTIME_DIR ??
@@ -32,8 +31,7 @@ const generatedDirectory = path.join(runtimeDirectory, 'generated');
 const executableName =
   process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
 const bundledExecutable = path.join(runtimeDirectory, 'bin', executableName);
-const configPath = path.join(generatedDirectory, 'sing-box.json');
-const haproxyConfigPath = path.join(generatedDirectory, 'haproxy.cfg');
+
 const haproxySocketPath =
   process.env.HAPROXY_SOCKET ??
   (process.platform === 'win32'
@@ -73,10 +71,6 @@ function freshMetrics(initial = {}) {
     previousAt: Date.now(),
     nodeConnections: new Map(),
     roundRobin: 0,
-    haproxyRawBytesIn: 0,
-    haproxyRawBytesOut: 0,
-    haproxyRawConnections: 0,
-    haproxyInitialized: false,
   };
 }
 
@@ -163,32 +157,39 @@ function waitForSocksReply(socket, timeoutMs) {
 
 async function openSocksTunnel(adapterPort, host, port, timeoutMs) {
   const socket = net.createConnection({ host: '127.0.0.1', port: adapterPort });
-  socket.setTimeout(timeoutMs, () =>
-    socket.destroy(new Error('Connecting to the proxy adapter timed out')),
-  );
-  await new Promise((resolve, reject) => {
-    socket.once('connect', resolve);
-    socket.once('error', reject);
-  });
-  socket.write(Buffer.from([0x05, 0x01, 0x00]));
-  const greeting = await waitForData(socket, 2, timeoutMs);
-  if (greeting[0] !== 0x05 || greeting[1] !== 0x00)
-    throw new Error('SOCKS5 authentication negotiation failed');
+  try {
+    socket.setTimeout(timeoutMs, () =>
+      socket.destroy(new Error('Connecting to the proxy adapter timed out')),
+    );
+    await new Promise((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    socket.write(Buffer.from([0x05, 0x01, 0x00]));
+    const greeting = await waitForData(socket, 2, timeoutMs);
+    if (greeting[0] !== 0x05 || greeting[1] !== 0x00)
+      throw new Error('SOCKS5 authentication negotiation failed');
 
-  const hostBuffer = Buffer.from(host);
-  if (hostBuffer.length > 255) throw new Error('Probe hostname is too long');
-  socket.write(
-    Buffer.concat([
-      Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuffer.length]),
-      hostBuffer,
-      Buffer.from([(port >> 8) & 0xff, port & 0xff]),
-    ]),
-  );
-  const response = await waitForSocksReply(socket, timeoutMs);
-  if (response[1] !== 0x00)
-    throw new Error(`SOCKS5 target connection failed with code ${response[1]}`);
-  socket.setTimeout(0);
-  return socket;
+    const hostBuffer = Buffer.from(host);
+    if (hostBuffer.length > 255) throw new Error('Probe hostname is too long');
+    socket.write(
+      Buffer.concat([
+        Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuffer.length]),
+        hostBuffer,
+        Buffer.from([(port >> 8) & 0xff, port & 0xff]),
+      ]),
+    );
+    const response = await waitForSocksReply(socket, timeoutMs);
+    if (response[1] !== 0x00)
+      throw new Error(
+        `SOCKS5 target connection failed with code ${response[1]}`,
+      );
+    socket.setTimeout(0);
+    return socket;
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
 }
 
 async function probeThroughNode(node, probeUrl, timeoutSeconds) {
@@ -196,7 +197,8 @@ async function probeThroughNode(node, probeUrl, timeoutSeconds) {
   let socket;
   let stream;
   try {
-    const target = new URL(probeUrl);
+    const { url: target, expected } = probeTarget(probeUrl);
+    probeUrl = target.href;
     const targetPort = Number(
       target.port || (target.protocol === 'https:' ? 443 : 80),
     );
@@ -235,12 +237,18 @@ async function probeThroughNode(node, probeUrl, timeoutSeconds) {
         () => reject(new Error('HTTP probe timed out')),
         timeoutSeconds * 1000,
       );
-      stream.once('data', (chunk) => {
+      let line = '';
+      stream.on('data', function readLine(chunk) {
+        line += chunk.toString('latin1', 0, Math.min(chunk.length, 8193));
+        const end = line.indexOf('\r\n');
+        if (end < 0 && line.length <= 8192) return;
+        stream.off('data', readLine);
         clearTimeout(timeout);
-        const firstLine = chunk.toString('utf8').split('\r\n')[0];
-        const match = firstLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/);
-        if (!match)
-          reject(new Error('Probe URL returned no valid HTTP response'));
+        const match =
+          end >= 0 &&
+          end <= 8192 &&
+          /^HTTP\/\d(?:\.\d)?\s+(\d{3})(?:\s|$)/.exec(line.slice(0, end));
+        if (!match) reject(new Error('Invalid HTTP status line'));
         else resolve(Number(match[1]));
       });
       stream.once('error', (error) => {
@@ -252,12 +260,16 @@ async function probeThroughNode(node, probeUrl, timeoutSeconds) {
       `GET ${target.pathname}${target.search} HTTP/1.1\r\nHost: ${target.host}\r\nUser-Agent: KitsuneGate/0.1\r\nConnection: close\r\n\r\n`,
     );
     const statusCode = await response;
+    const ok =
+      expected === null
+        ? statusCode >= 200 && statusCode < 300
+        : statusCode === expected;
     return {
-      ok: statusCode >= 200 && statusCode < 500,
+      ok,
       statusCode,
       latencyMs: performance.now() - started,
       url: probeUrl,
-      error: null,
+      error: ok ? null : `HTTP ${statusCode}; expected ${expected ?? '2xx'}`,
     };
   } catch (error) {
     return {
@@ -283,7 +295,8 @@ class RelayRuntime {
     this.version = null;
     this.lastError = null;
     this.startedAt = null;
-    this.reloading = false;
+    this.queue = Promise.resolve();
+    this.retired = new Set();
     this.healthTimer = null;
     this.sampleTimer = null;
     this.cleanupTimer = null;
@@ -307,7 +320,13 @@ class RelayRuntime {
   }
 
   async start() {
-    await this.reload('Application startup');
+    try {
+      await this.reload('Application startup');
+    } catch (error) {
+      this.status = 'error';
+      this.lastError = error.message;
+      this.writeLog('engine', 'error', error.message);
+    }
     this.healthTimer = setInterval(
       () =>
         void this.runScheduledHealthChecks().catch((error) => {
@@ -361,228 +380,191 @@ class RelayRuntime {
     clearInterval(this.healthTimer);
     clearInterval(this.sampleTimer);
     clearInterval(this.cleanupTimer);
+    this.stopping = true;
+    await this.queue;
     for (const entry of this.servers.values()) entry.server.close();
     this.servers.clear();
-    if (this.coreProcess) {
-      this.coreProcess.kill('SIGTERM');
-      this.coreProcess = null;
-    }
-    if (this.haproxyProcess) {
-      this.haproxyProcess.kill('SIGTERM');
-      this.haproxyProcess = null;
-    }
+    const generations = [this.generation, ...this.retired];
+    this.generation = null;
+    this.retired.clear();
+    await Promise.all(generations.map(discard));
     this.status = 'stopped';
   }
 
-  async reload(reason = 'Configuration update') {
-    if (this.reloading) return this.getStatus();
-    this.reloading = true;
-    try {
-      this.status = 'reloading';
-      for (const entry of this.servers.values()) entry.server.close();
-      this.servers.clear();
-      if (this.coreProcess) {
-        this.coreProcess.kill('SIGTERM');
-        this.coreProcess = null;
+  groups() {
+    const groups = getRawStateForEngine();
+    for (const group of groups)
+      for (const node of group.nodes) {
+        node.adapter_port =
+          this.generation?.ports.get(node.id) ?? node.adapter_port;
       }
-      if (this.haproxyProcess) {
-        this.haproxyProcess.kill('SIGTERM');
-        this.haproxyProcess = null;
-      }
+    return groups;
+  }
 
-      const binary = executablePath();
-      if (!binary) {
-        this.status = 'missing';
-        this.lastError = `${executableName} was not found; run npm run core:install`;
-        this.writeLog('engine', 'error', this.lastError);
-        return this.getStatus();
-      }
-
-      const groups = getRawStateForEngine();
-      const haproxyBinary =
-        (process.env.KITSUNEGATE_BALANCER ?? process.env.RELAYDECK_BALANCER) ===
-        'builtin'
-          ? null
-          : haproxyExecutablePath();
-      this.useHAProxy = Boolean(haproxyBinary);
-      const currentGroupIds = new Set(groups.map((group) => group.id));
-      for (const groupId of this.metrics.keys()) {
-        if (!currentGroupIds.has(groupId)) this.metrics.delete(groupId);
-      }
-      for (const groupId of this.lastProbeAt.keys()) {
-        if (!currentGroupIds.has(groupId)) this.lastProbeAt.delete(groupId);
-      }
-      for (const groupId of this.selectedByGroup.keys()) {
-        if (!currentGroupIds.has(groupId)) this.selectedByGroup.delete(groupId);
-      }
-      for (const group of groups.filter((item) => item.enabled)) {
-        if (!this.metrics.has(group.id))
-          this.metrics.set(
-            group.id,
-            freshMetrics(getLatestTrafficTotals(group.id)),
-          );
-        const metrics = this.metrics.get(group.id);
-        metrics.haproxyInitialized = false;
-        metrics.haproxyRawBytesIn = 0;
-        metrics.haproxyRawBytesOut = 0;
-        metrics.haproxyRawConnections = 0;
-        metrics.previousBytesIn = metrics.bytesIn;
-        metrics.previousBytesOut = metrics.bytesOut;
-        metrics.previousAt = Date.now();
-        metrics.speedIn = 0;
-        metrics.speedOut = 0;
-      }
-      fs.writeFileSync(
-        configPath,
-        renderSingBoxConfig(groups, { logLevel: getSettings().logLevel }),
-        'utf8',
-      );
-      if (this.useHAProxy) {
-        fs.mkdirSync(path.dirname(haproxySocketPath), { recursive: true });
-        fs.rmSync(haproxySocketPath, { force: true });
-        fs.writeFileSync(
-          haproxyConfigPath,
-          renderHAProxyConfig(groups, { statsSocket: haproxySocketPath }),
-          'utf8',
+  async retire(gen) {
+    gen.retired = true;
+    this.retired.add(gen);
+    const finish = () => {
+      if (this.retired.delete(gen))
+        void discard(gen).catch((error) =>
+          this.writeLog('engine', 'warning', error.message),
         );
-      }
+    };
+    gen.finish = finish;
+    if (alive(gen.haproxy)) {
+      gen.haproxy.once('exit', finish);
+      // Stop accepting on the old frontends while retaining the statistics socket
+      // until the last established stream has closed and its bytes are recorded.
       try {
-        const versionResult = await execFileAsync(binary, ['version'], {
-          windowsHide: true,
-        });
-        this.version =
-          versionResult.stdout.split(/\r?\n/)[0]?.trim() || 'unknown';
-        await execFileAsync(binary, ['check', '-c', configPath], {
-          windowsHide: true,
-        });
-        if (this.useHAProxy) {
-          const haproxyVersionResult = await execFileAsync(
-            haproxyBinary,
-            ['-v'],
-            { windowsHide: true },
+        for (const id of gen.frontends) {
+          const reply = await this.haproxyCommand(
+            'shutdown frontend pool_' + haproxyName(id),
+            2000,
+            gen,
           );
-          this.haproxyVersion =
-            haproxyVersionResult.stdout.split(/\r?\n/)[0]?.trim() || 'unknown';
-          await execFileAsync(haproxyBinary, ['-c', '-f', haproxyConfigPath], {
-            windowsHide: true,
-          });
+          if (/error|unknown|can't|not found/i.test(reply))
+            throw new Error(reply.trim());
         }
+        gen.draining = true;
       } catch (error) {
-        this.status = 'error';
-        this.lastError = error.stderr || error.message;
-        this.writeLog(
-          'sing-box',
-          'error',
-          `Configuration validation failed: ${this.lastError}`,
-        );
-        return this.getStatus();
-      }
-
-      const processInstance = spawn(binary, ['run', '-c', configPath], {
-        cwd: generatedDirectory,
-        windowsHide: true,
-      });
-      this.coreProcess = processInstance;
-      processInstance.stdout.on('data', (chunk) =>
-        chunk
-          .toString()
-          .split(/\r?\n/)
-          .forEach((line) => this.writeLog('sing-box', logLevel(line), line)),
-      );
-      processInstance.stderr.on('data', (chunk) =>
-        chunk
-          .toString()
-          .split(/\r?\n/)
-          .forEach((line) => this.writeLog('sing-box', logLevel(line), line)),
-      );
-      processInstance.on('exit', (code) => {
-        if (this.coreProcess === processInstance && this.status === 'running') {
-          this.status = 'error';
-          this.lastError = `sing-box exited unexpectedly with code ${code}`;
-          this.writeLog('sing-box', 'error', this.lastError);
-        }
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      if (this.coreProcess.exitCode !== null)
-        throw new Error(
-          `sing-box failed to start with code ${this.coreProcess.exitCode}`,
-        );
-      if (this.useHAProxy) {
-        const haproxyProcess = spawn(
-          haproxyBinary,
-          ['-W', '-db', '-f', haproxyConfigPath],
-          { cwd: generatedDirectory },
-        );
-        this.haproxyProcess = haproxyProcess;
-        haproxyProcess.stdout.on('data', (chunk) =>
-          chunk
-            .toString()
-            .split(/\r?\n/)
-            .forEach((line) => this.writeLog('haproxy', logLevel(line), line)),
-        );
-        haproxyProcess.stderr.on('data', (chunk) =>
-          chunk
-            .toString()
-            .split(/\r?\n/)
-            .forEach((line) => this.writeLog('haproxy', logLevel(line), line)),
-        );
-        haproxyProcess.on('exit', (code) => {
-          if (
-            this.haproxyProcess === haproxyProcess &&
-            this.status === 'running'
-          ) {
-            this.status = 'error';
-            this.lastError = `HAProxy exited unexpectedly with code ${code}`;
-            this.writeLog('haproxy', 'error', this.lastError);
-          }
-        });
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        if (this.haproxyProcess.exitCode !== null)
-          throw new Error(
-            `HAProxy failed to start with code ${this.haproxyProcess.exitCode}`,
-          );
-      } else {
-        for (const group of groups.filter((item) => item.enabled))
-          this.createGroupServer(group);
-      }
-      this.status = 'running';
-      this.lastError = null;
-      this.startedAt = new Date().toISOString();
-      this.writeLog(
-        'engine',
-        'info',
-        `${reason}: sing-box and ${this.useHAProxy ? 'HAProxy' : 'the built-in load balancer'} started (${os.platform()} ${os.arch()})`,
-      );
-      if (!this.useHAProxy)
         this.writeLog(
           'haproxy',
           'warning',
-          'HAProxy was not found or built-in mode is selected; the KitsuneGate TCP balancer is routing listener ports.',
+          'Could not collect draining counters: ' + error.message,
         );
-      void this.testAll().catch((error) =>
-        this.writeLog(
-          'engine',
-          'error',
-          `Health check startup failed: ${error.message}`,
-        ),
-      );
-      return this.getStatus();
-    } catch (error) {
-      this.status = 'error';
-      this.lastError =
-        error instanceof Error ? error.message : 'Engine startup failed';
-      this.writeLog('engine', 'error', this.lastError);
-      return this.getStatus();
-    } finally {
-      this.reloading = false;
-    }
+        gen.haproxy.kill('SIGUSR1');
+      }
+    } else if (!gen.clients) finish();
   }
 
-  createGroupServer(group) {
-    const metrics = this.metrics.get(group.id) ?? freshMetrics();
-    this.metrics.set(group.id, metrics);
+  reload(reason, mutate, requiresReload = () => true) {
+    const task = this.queue.then(() =>
+      this.apply(reason, mutate, requiresReload),
+    );
+    this.queue = task.catch(() => {});
+    return task;
+  }
+
+  async apply(reason, mutate, requiresReload) {
+    if (this.stopping) throw new Error('Engine is shutting down.');
+    // Stage the SQL mutation synchronously, snapshot its candidate, then release
+    // the database before starting any asynchronous subprocess or listener work.
+    let groups, settings, candidateResult;
+    const previousSettings = getSettings();
+    db.exec('SAVEPOINT candidate');
+    try {
+      candidateResult = mutate?.();
+      groups = getRawStateForEngine();
+      settings = getSettings();
+    } finally {
+      db.exec('ROLLBACK TO candidate; RELEASE candidate');
+    }
+    const commit = () => {
+      db.exec('BEGIN');
+      try {
+        const result = mutate?.();
+        db.exec('COMMIT');
+        return result;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    };
+    if (!requiresReload(previousSettings, settings)) return commit();
+    const previous = this.generation;
+    const haproxyBinary =
+      (process.env.KITSUNEGATE_BALANCER ?? process.env.RELAYDECK_BALANCER) ===
+      'builtin'
+        ? null
+        : haproxyExecutablePath();
+    const gen = await prepare(groups, {
+      directory: generatedDirectory,
+      socketPath: haproxySocketPath,
+      binary: executablePath(),
+      haproxyBinary,
+      previous,
+      editedNodeId: candidateResult?.sourceType ? candidateResult.id : null,
+      logLevel: settings.logLevel,
+      log: (source, line) => this.writeLog(source, logLevel(line), line),
+      onExit: (generation, source, code) => {
+        if (this.generation === generation && !this.stopping) {
+          this.status = 'error';
+          this.lastError = source + ' exited with code ' + code;
+          this.writeLog(source, 'error', this.lastError);
+        }
+      },
+    });
+    const listeners = new Map();
+    const added = [];
+    let result;
+    try {
+      if (!haproxyBinary)
+        for (const group of groups.filter((g) => g.enabled)) {
+          const key = group.listen_host + ':' + group.listen_port;
+          let entry = this.servers.get(key);
+          if (!entry) {
+            entry = this.createGroupServer(group);
+            added.push(entry);
+            await listen(entry.server, group.listen_port, group.listen_host);
+          }
+          listeners.set(key, { entry, group });
+        }
+      if (!alive(gen.core) || (haproxyBinary && !alive(gen.haproxy)))
+        throw new Error(
+          'Configuration rejected: candidate core exited before activation.',
+        );
+      result = commit();
+    } catch (error) {
+      for (const entry of added) entry.server.close();
+      await discard(gen);
+      throw error;
+    }
+    for (const [key, entry] of this.servers)
+      if (!listeners.has(key)) entry.server.close();
+    this.servers.clear();
+    for (const [key, { entry, group }] of listeners) {
+      entry.group = group;
+      this.servers.set(key, entry);
+    }
+    this.generation = gen;
+    this.coreProcess = gen.core;
+    this.haproxyProcess = gen.haproxy;
+    this.useHAProxy = !!haproxyBinary;
+    this.version = gen.version;
+    this.haproxyVersion = gen.haproxyVersion;
+    this.metrics = new Map(
+      groups
+        .filter((g) => g.enabled)
+        .map((g) => {
+          const m =
+            this.metrics.get(g.id) ??
+            freshMetrics(getLatestTrafficTotals(g.id));
+          return [g.id, m];
+        }),
+    );
+    this.status = 'running';
+    this.lastError = null;
+    this.startedAt = new Date().toISOString();
+    if (previous) await this.retire(previous);
+    this.writeLog('engine', 'info', reason + ' applied.');
+    this.groupTests.clear();
+    void this.testAll().catch((error) =>
+      this.writeLog('engine', 'warning', error.message),
+    );
+    return mutate ? result : this.getStatus();
+  }
+
+  createGroupServer(initialGroup) {
+    const entry = { group: initialGroup };
+
     const server = net.createServer((client) => {
+      const group = entry.group,
+        generation = this.generation,
+        metrics = this.metrics.get(group.id);
+      if (!generation || !metrics) {
+        client.destroy();
+        return;
+      }
       const node = this.selectNode(group, metrics);
       if (!node) {
         this.writeLog(
@@ -597,6 +579,7 @@ class RelayRuntime {
         host: '127.0.0.1',
         port: node.adapter_port,
       });
+      generation.clients++;
       metrics.activeConnections += 1;
       metrics.totalConnections += 1;
       metrics.nodeConnections.set(
@@ -607,6 +590,8 @@ class RelayRuntime {
       const finish = () => {
         if (finished) return;
         finished = true;
+        generation.clients--;
+        if (generation.retired && !generation.clients) generation.finish();
         metrics.activeConnections = Math.max(0, metrics.activeConnections - 1);
         metrics.nodeConnections.set(
           node.id,
@@ -635,27 +620,17 @@ class RelayRuntime {
       upstream.pipe(client);
     });
     server.on('error', (error) =>
-      this.writeLog(
-        'balancer',
-        'error',
-        `${group.name} failed to listen on ${group.listen_host}:${group.listen_port}: ${error.message}`,
-      ),
+      this.writeLog('balancer', 'error', error.message),
     );
-    server.listen(group.listen_port, group.listen_host, () =>
-      this.writeLog(
-        'balancer',
-        'info',
-        `${group.name} is listening on ${group.listen_host}:${group.listen_port} in ${group.mode} mode.`,
-      ),
-    );
-    this.servers.set(group.id, { server, group });
+    entry.server = server;
+    return entry;
   }
 
-  haproxyCommand(command, timeoutMs = 2000) {
+  haproxyCommand(command, timeoutMs = 2000, generation = this.generation) {
     if (!this.useHAProxy || !this.haproxyProcess) return Promise.resolve('');
     return new Promise((resolve, reject) => {
       let output = '';
-      const socket = net.createConnection({ path: haproxySocketPath });
+      const socket = net.createConnection({ path: generation.socket });
       const timeout = setTimeout(
         () => socket.destroy(new Error('HAProxy Runtime API timed out')),
         timeoutMs,
@@ -678,9 +653,13 @@ class RelayRuntime {
 
   async syncHAProxyGroup(groupId) {
     if (!this.useHAProxy || this.status !== 'running') return;
-    const group = getRawStateForEngine().find((item) => item.id === groupId);
+    const group = this.groups().find((item) => item.id === groupId);
     if (!group?.enabled) return;
-    const enabled = group.nodes.filter((node) => node.enabled);
+    const enabled = group.nodes.filter(
+      (node) =>
+        node.enabled &&
+        (group.mode !== 'fixed' || node.id === group.selected_node_id),
+    );
     const available = enabled.filter(
       (node) => node.health_status !== 'unhealthy',
     );
@@ -730,102 +709,90 @@ class RelayRuntime {
   }
 
   async refreshHAProxyMetrics() {
-    if (!this.useHAProxy || this.status !== 'running') return;
-    let output;
-    let sessionOutput = '';
+    if (!this.useHAProxy || this.status !== 'running') return false;
+    const current = this.generation;
+    const connections = new Map();
     try {
-      output = await this.haproxyCommand('show stat', 3000);
-      sessionOutput = await this.haproxyCommand('show sess all', 3000);
+      for (const gen of [current, ...this.retired]) {
+        if (!gen.haproxy || (gen.retired && !gen.draining)) continue;
+        const output = await this.haproxyCommand('show stat', 3000, gen);
+        const sessions = parseHAProxyActiveSessionBytes(
+          await this.haproxyCommand('show sess all', 3000, gen),
+        );
+        if (!output.trim())
+          throw new Error('Empty HAProxy statistics response');
+        const [header, ...lines] = output.trim().split(/\r?\n/);
+        const col = Object.fromEntries(
+          header
+            .replace(/^#\s*/, '')
+            .split(',')
+            .map((key, i) => [key, i]),
+        );
+        let open = 0;
+        for (const line of lines) {
+          const fields = line.split(',');
+          if (fields[col.svname] !== 'FRONTEND') continue;
+          const proxy = fields[col.pxname],
+            id = proxy.slice('pool_'.length);
+          if (!proxy.startsWith('pool_')) continue;
+          const active = Number(fields[col.scur]);
+          open += active;
+          connections.set(id, (connections.get(id) ?? 0) + active);
+          const metrics = this.metrics.get(id);
+          if (!metrics) continue;
+          const inFlight = sessions.get(proxy);
+          const prev = gen.counters.get(id) ?? {
+            input: 0,
+            output: 0,
+            connections: 0,
+          };
+          const input = advanceMonotonicCounter(
+            prev.input,
+            Number(fields[col.bin]) + (inFlight?.bytesIn ?? 0),
+          );
+          const out = advanceMonotonicCounter(
+            prev.output,
+            Number(fields[col.bout]) + (inFlight?.bytesOut ?? 0),
+          );
+          const total = Number(fields[col.stot]);
+          metrics.bytesIn += input.delta;
+          metrics.bytesOut += out.delta;
+          metrics.totalConnections += Math.max(0, total - prev.connections);
+          gen.counters.set(id, {
+            input: input.current,
+            output: out.current,
+            connections: total,
+          });
+        }
+        if (gen.draining && !open) gen.finish();
+      }
+      if (current !== this.generation) return false;
+      for (const [id, m] of this.metrics)
+        m.activeConnections = connections.get(id) ?? 0;
       this.lastMetricsErrorAt = 0;
+      return true;
     } catch (error) {
-      const timestamp = Date.now();
       if (
         !this.lastMetricsErrorAt ||
-        timestamp - this.lastMetricsErrorAt >= 30_000
+        Date.now() - this.lastMetricsErrorAt >= 30000
       ) {
         this.writeLog(
           'haproxy',
           'warning',
-          `Failed to read statistics: ${error.message} (duplicate errors are suppressed for 30 seconds)`,
+          'Failed to read statistics: ' + error.message,
         );
-        this.lastMetricsErrorAt = timestamp;
+        this.lastMetricsErrorAt = Date.now();
       }
-      return;
-    }
-    const lines = output.trim().split(/\r?\n/);
-    const header = lines.shift()?.replace(/^#\s*/, '').split(',') ?? [];
-    const position = Object.fromEntries(
-      header.map((name, index) => [name, index]),
-    );
-    const groupsByProxy = new Map(
-      getRawStateForEngine().map((group) => [
-        `pool_${haproxyName(group.id)}`,
-        group,
-      ]),
-    );
-    const activeSessionBytes = parseHAProxyActiveSessionBytes(sessionOutput);
-    for (const line of lines) {
-      if (!line) continue;
-      const values = line.split(',');
-      if (values[position.svname] !== 'FRONTEND') continue;
-      const group = groupsByProxy.get(values[position.pxname]);
-      if (!group) continue;
-      const metrics = this.metrics.get(group.id) ?? freshMetrics();
-      const activeBytes = activeSessionBytes.get(values[position.pxname]) ?? {
-        bytesIn: 0,
-        bytesOut: 0,
-      };
-      // HAProxy normally commits bin/bout when a TCP stream closes. Add the
-      // in-flight stream totals so long downloads and persistent tunnels are
-      // visible during the transfer instead of appearing as a spike at close.
-      const rawBytesIn =
-        Number(values[position.bin] || 0) + activeBytes.bytesIn;
-      const rawBytesOut =
-        Number(values[position.bout] || 0) + activeBytes.bytesOut;
-      const rawConnections = Number(values[position.stot] || 0);
-      if (!metrics.haproxyInitialized) {
-        metrics.haproxyRawBytesIn = rawBytesIn;
-        metrics.haproxyRawBytesOut = rawBytesOut;
-        metrics.haproxyRawConnections = rawConnections;
-        metrics.haproxyInitialized = true;
-        metrics.activeConnections = Number(values[position.scur] || 0);
-        this.metrics.set(group.id, metrics);
-        continue;
-      }
-      // The two runtime commands are adjacent rather than an atomic snapshot.
-      // If a stream closes between them, the combined observation can briefly
-      // fall before the settled stat catches up. A monotonic baseline prevents
-      // those same bytes from being counted again on the following sample.
-      const inputCounter = advanceMonotonicCounter(
-        metrics.haproxyRawBytesIn,
-        rawBytesIn,
-      );
-      const outputCounter = advanceMonotonicCounter(
-        metrics.haproxyRawBytesOut,
-        rawBytesOut,
-      );
-      metrics.bytesIn += inputCounter.delta;
-      metrics.bytesOut += outputCounter.delta;
-      metrics.totalConnections += Math.max(
-        0,
-        rawConnections - metrics.haproxyRawConnections,
-      );
-      metrics.haproxyRawBytesIn = inputCounter.current;
-      metrics.haproxyRawBytesOut = outputCounter.current;
-      metrics.haproxyRawConnections = rawConnections;
-      metrics.activeConnections = Number(values[position.scur] || 0);
-      this.metrics.set(group.id, metrics);
+      return false;
     }
   }
 
   selectNode(group, metrics) {
-    group =
-      getRawStateForEngine().find((item) => item.id === group.id) ?? group;
+    group = this.groups().find((item) => item.id === group.id) ?? group;
     const enabled = group.nodes.filter((node) => node.enabled);
-    const healthy = enabled.filter(
+    const candidates = enabled.filter(
       (node) => node.health_status !== 'unhealthy',
     );
-    const candidates = healthy.length ? healthy : enabled;
     if (!candidates.length) return null;
     if (group.mode === 'fixed')
       return (
@@ -873,8 +840,9 @@ class RelayRuntime {
     )[0];
   }
 
-  async testNode(id, syncHAProxy = true) {
-    const rawGroups = getRawStateForEngine();
+  async testNode(id, syncHAProxy = true, draft) {
+    const generation = this.generation;
+    const rawGroups = this.groups();
     const group = rawGroups.find((item) =>
       item.nodes.some((node) => node.id === id),
     );
@@ -893,40 +861,47 @@ class RelayRuntime {
       };
     let probe;
     const attempts = [];
-    for (const probeUrl of group.probe_urls) {
-      probe = await probeThroughNode(node, probeUrl, group.probe_timeout);
+    for (const probeUrl of (draft ?? group).probe_urls) {
+      probe = await probeThroughNode(
+        node,
+        probeUrl,
+        (draft ?? group).probe_timeout,
+      );
       attempts.push(probe);
       if (probe.ok) break;
     }
+    if (generation !== this.generation || draft)
+      return { ...getNode(id), probe: { ...probe, attempts } };
     const recorded = recordNodeHealth(id, { ...probe, attempts });
     if (syncHAProxy) await this.syncHAProxyGroup(group.id);
     return recorded;
   }
 
-  async testGroup(id) {
+  async testGroup(id, draft) {
+    if (draft) return this.performGroupTest(id, draft);
     if (this.groupTests.has(id)) return this.groupTests.get(id);
-    const pending = this.performGroupTest(id).finally(() =>
-      this.groupTests.delete(id),
+    const pending = this.performGroupTest(id).finally(
+      () => this.groupTests.get(id) === pending && this.groupTests.delete(id),
     );
     this.groupTests.set(id, pending);
     return pending;
   }
 
-  async performGroupTest(id) {
-    const group = getRawStateForEngine().find((item) => item.id === id);
+  async performGroupTest(id, draft) {
+    const group = this.groups().find((item) => item.id === id);
     if (!group) throw new Error('Proxy group not found.');
     const started = Date.now();
     const results = await Promise.all(
       group.nodes
         .filter((node) => node.enabled)
-        .map((node) => this.testNode(node.id, false)),
+        .map((node) => this.testNode(node.id, false, draft)),
     );
-    await this.syncHAProxyGroup(id);
+    if (!draft) await this.syncHAProxyGroup(id);
     return {
       groupId: id,
       groupName: group.name,
       durationMs: Date.now() - started,
-      probeUrl: group.probe_urls.join(' · '),
+      probeUrl: (draft ?? group).probe_urls.join(' · '),
       results,
     };
   }
@@ -958,7 +933,13 @@ class RelayRuntime {
     if (this.sampling) return;
     this.sampling = true;
     try {
-      await this.refreshHAProxyMetrics();
+      if (
+        this.status !== 'running' ||
+        (this.useHAProxy && (await this.refreshHAProxyMetrics()) === false)
+      ) {
+        this.sampleGap = true;
+        return;
+      }
       const timestamp = Date.now();
       for (const [groupId, metrics] of this.metrics) {
         const intervalMs = Math.max(100, timestamp - metrics.previousAt);
@@ -971,8 +952,9 @@ class RelayRuntime {
         metrics.previousBytesOut = metrics.bytesOut;
         metrics.previousAt = timestamp;
         metrics.intervalMs = intervalMs;
-        addTrafficSample(groupId, metrics);
+        if (!this.sampleGap) addTrafficSample(groupId, metrics);
       }
+      this.sampleGap = false;
     } finally {
       this.sampling = false;
     }
@@ -1010,7 +992,7 @@ class RelayRuntime {
       haproxyVersion: this.haproxyVersion,
       startedAt: this.startedAt,
       lastError: this.lastError,
-      configPath,
+      configPath: this.generation?.coreFile ?? null,
     };
   }
 }

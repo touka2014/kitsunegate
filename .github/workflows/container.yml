@@ -81,6 +81,7 @@ jobs:
         run: |
           case "$GITHUB_REF_NAME" in
             v0.1.0) title="$GITHUB_REF_NAME — First Tail" ;;
+            v0.1.1) title="$GITHUB_REF_NAME — Unbroken Thread" ;;
             *) title="$GITHUB_REF_NAME" ;;
           esac
           echo "title=$title" >> "$GITHUB_OUTPUT"

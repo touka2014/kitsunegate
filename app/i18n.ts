@@ -22,6 +22,18 @@ type LocalizedValues = [
 ];
 
 const phrases: Record<string, LocalizedValues> = {
+  草稿试测: [
+    'Test draft',
+    '下書きをテスト',
+    'Tester le brouillon',
+    '초안 테스트',
+  ],
+  '可选预期 HTTP 状态码，例如': [
+    'Optional expected HTTP status, e.g.',
+    '期待する HTTP ステータス（任意）、例',
+    'Code HTTP attendu (facultatif), ex.',
+    '예상 HTTP 상태 코드(선택), 예',
+  ],
   总览: ['Overview', '概要', 'Vue d’ensemble', '개요'],
   代理组: ['Proxy groups', 'プロキシグループ', 'Groupes proxy', '프록시 그룹'],
   全部节点: ['All nodes', 'すべてのノード', 'Tous les nœuds', '모든 노드'],

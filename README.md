@@ -100,13 +100,15 @@ npm run core:install
 npm run dev
 ```
 
-Open `http://localhost:3000`. The local API binds to `127.0.0.1:8787`. Windows uses KitsuneGate's built-in TCP balancer because HAProxy does not provide an official native Windows distribution; sing-box still carries real proxy traffic and health checks.
+Open `http://localhost:3000` and sign in as `kitsunegate`. For local development the first start generates a password in `data/.admin-password`. You can instead set `KITSUNEGATE_ADMIN_USER` and `KITSUNEGATE_ADMIN_PASSWORD` before starting. The local API binds to `127.0.0.1:8787` and requires the same credentials. In Docker, Nginx reaches the API through a private Unix socket. `/readyz` returns HTTP 503 when the data plane is unavailable. API clients must send `Content-Type: application/json` on writes. Windows uses KitsuneGate's built-in TCP balancer because HAProxy does not provide an official native Windows distribution; sing-box still carries real proxy traffic and health checks.
 
 Test a listener with:
 
 ```powershell
 curl.exe --proxy socks5h://127.0.0.1:1188 https://www.gstatic.com/generate_204
 ```
+
+Health-check targets accept one URL per line, optionally followed by a space and an expected HTTP status, e.g. `https://example.org/check 204`. The default is 204 for `/generate_204` and any 2xx response elsewhere. Testing draft settings leaves saved health counters and routing untouched.
 
 ## Data and upgrades
 

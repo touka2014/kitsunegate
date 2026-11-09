@@ -13,8 +13,8 @@ export function renderHAProxyConfig(groups, options = {}) {
   const lines = [
     'global',
     '  log stdout format raw local0',
-    '  master-worker',
-    `  stats socket ${statsSocket} mode 660 level admin`,
+
+    `  stats socket ${statsSocket} mode 600 level admin expose-fd listeners`,
     '  maxconn 60000',
     '',
     'defaults',
@@ -36,18 +36,16 @@ export function renderHAProxyConfig(groups, options = {}) {
     lines.push(`  bind ${group.listen_host}:${group.listen_port}`);
     lines.push('  mode tcp');
     lines.push(`  balance ${modeAlgorithm(group)}`);
-    lines.push(`  # probe_urls: ${group.probe_urls.join(', ')}`);
+
     const activeNodes = group.nodes.filter((node) => node.enabled);
     activeNodes.forEach((node, index) => {
       const selected = group.selected_node_id === node.id;
       let backup = '';
       if (group.mode === 'fallback' && index > 0) backup = ' backup';
-      if (
-        (group.mode === 'fixed' || group.mode === 'latency_best') &&
-        group.selected_node_id &&
-        !selected
-      )
+      if (group.mode === 'fixed' && !selected) return;
+      if (group.mode === 'latency_best' && group.selected_node_id && !selected)
         backup = ' backup';
+      if (node.health_status === 'unhealthy') backup += ' disabled';
       lines.push(
         `  server ${escapeName(node.id)} 127.0.0.1:${node.adapter_port} weight ${node.weight} check inter 5s rise ${group.rise_threshold} fall ${group.fall_threshold}${backup}`,
       );
@@ -75,15 +73,13 @@ function parseSimpleUri(node) {
 
 export function renderSingBoxConfig(groups, options = {}) {
   const nodes = groups
+    .filter((group) => group.enabled)
     .flatMap((group) => group.nodes)
     .filter((node) => node.enabled);
-  const parsedNodes = nodes.flatMap((node) => {
-    try {
-      return [{ node, outbound: parseSimpleUri(node) }];
-    } catch {
-      return [];
-    }
-  });
+  const parsedNodes = nodes.map((node) => ({
+    node,
+    outbound: parseSimpleUri(node),
+  }));
   return JSON.stringify(
     {
       $schema: 'https://sing-box.sagernet.org/schema.json',
