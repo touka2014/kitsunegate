@@ -19,4 +19,8 @@ jobs:
             if docker exec kg-test curl -fsS http://localhost:8080/readyz; then break; fi
             sleep 1
           done
+          if ! docker exec kg-test curl -fsS http://localhost:8080/readyz; then
+            docker exec kg-test curl -fsS -u kitsunegate:isolated-ci http://localhost:8080/api/state | jq '.engine'
+            exit 1
+          fi
           docker exec -i kg-test node --input-type=module < scripts/test-isolation.mjs
