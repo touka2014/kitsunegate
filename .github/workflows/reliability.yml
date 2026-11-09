@@ -13,7 +13,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --name kg-test --network none -d -e KITSUNEGATE_ADMIN_PASSWORD=isolated-ci kitsunegate:test
+          docker run --name kg-test --network none --ulimit nofile=65536:65536 -d -e KITSUNEGATE_ADMIN_PASSWORD=isolated-ci kitsunegate:test
           trap 'docker rm -f kg-test >/dev/null' EXIT
           for i in {1..30}; do
             if docker exec kg-test curl -fsS http://localhost:8080/readyz; then break; fi

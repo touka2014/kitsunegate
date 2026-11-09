@@ -15,7 +15,6 @@ export function renderHAProxyConfig(groups, options = {}) {
     '  log stdout format raw local0',
 
     `  stats socket ${statsSocket} mode 600 level admin expose-fd listeners`,
-    '  maxconn 60000',
     '',
     'defaults',
     '  mode tcp',
