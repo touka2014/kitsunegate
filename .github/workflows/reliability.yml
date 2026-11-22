@@ -23,4 +23,5 @@ jobs:
             docker exec kg-test curl -fsS -u kitsunegate:isolated-ci http://localhost:8080/api/state | jq '.engine'
             exit 1
           fi
+          docker exec kg-test node --test server/xray-core.test.mjs
           docker exec -i kg-test node --input-type=module < scripts/test-isolation.mjs

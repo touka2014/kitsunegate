@@ -1,417 +1,518 @@
-const protocols = new Set([
-  'vless',
-  'vmess',
-  'ss',
-  'trojan',
-  'hysteria2',
-  'socks',
-]);
-const networks = new Set(['tcp', 'ws', 'grpc', 'httpupgrade']);
+const protocols = {
+  vless: 'vless',
+  vmess: 'vmess',
+  ss: 'ss',
+  shadowsocks: 'ss',
+  trojan: 'trojan',
+  hysteria2: 'hysteria2',
+  hy2: 'hysteria2',
+  hysteria: 'hysteria2',
+  socks: 'socks',
+  socks5: 'socks',
+};
+const networks = new Set(['tcp', 'ws', 'grpc', 'httpupgrade', 'xhttp']);
 const securities = new Set(['none', 'tls', 'reality']);
+const text = (value, fallback = '') => String(value ?? fallback).trim();
 
-function text(value, fallback = '') {
-  return String(value ?? fallback).trim();
+function required(value, name) {
+  if (!text(value)) throw new Error(name + ' is required.');
+  return text(value);
 }
-
-function port(value, fallback = 443) {
-  const parsed = Number(value ?? fallback);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535)
+function protocolOf(value) {
+  const key = text(value).toLowerCase();
+  if (!Object.hasOwn(protocols, key))
+    throw new Error('Unsupported proxy protocol.');
+  return protocols[key];
+}
+function endpoint(address, value) {
+  const server = required(address, 'Node address').replace(
+    /^\[([^\]]+)\]$/,
+    '$1',
+  );
+  const serverPort = Number(value);
+  if (!Number.isInteger(serverPort) || serverPort < 1 || serverPort > 65535)
     throw new Error('Node port must be between 1 and 65535.');
-  return parsed;
+  return { server, serverPort };
 }
-
-function requireText(value, message) {
-  const parsed = text(value);
-  if (!parsed) throw new Error(message);
-  return parsed;
+function jsonObject(input, name) {
+  let value = input;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      throw new Error(name + ' must be valid JSON.');
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error(name + ' must be a JSON object.');
+  return value;
 }
-
-function normalizeProtocol(value) {
-  const protocol = text(value)
-    .toLowerCase()
-    .replace('shadowsocks', 'ss')
-    .replace('hy2', 'hysteria2')
-    .replace('socks5', 'socks');
-  if (!protocols.has(protocol))
-    throw new Error(`Protocol ${protocol || '(empty)'} is not supported.`);
-  return protocol;
-}
-
 export function normalizeManualConfig(input = {}) {
-  const protocol = normalizeProtocol(input.protocol);
-  const server = requireText(
-    input.server ?? input.address,
-    'Enter a node address.',
-  );
-  const serverPort = port(
-    input.serverPort ?? input.port,
-    protocol === 'ss' ? 8388 : 443,
-  );
-  const network = networks.has(input.network) ? input.network : 'tcp';
-  const security = securities.has(input.security)
-    ? input.security
-    : protocol === 'hysteria2'
-      ? 'tls'
-      : 'none';
+  const protocol = protocolOf(input.protocol);
+  const network =
+    input.network === 'raw'
+      ? 'tcp'
+      : input.network === 'splithttp'
+        ? 'xhttp'
+        : input.network || 'tcp';
+  const security =
+    input.security ||
+    (['hysteria2', 'trojan'].includes(protocol) ? 'tls' : 'none');
+  if (!networks.has(network))
+    throw new Error(
+      'Unsupported transport. Use native Xray JSON for advanced transports.',
+    );
+  if (!securities.has(security))
+    throw new Error('Unsupported transport security.');
+  if (input.allowInsecure && security === 'tls')
+    throw new Error(
+      'Xray requires certificate verification. Provide a trusted certificate or its SHA-256 pin.',
+    );
   const config = {
     protocol,
-    server,
-    serverPort,
-    uuid: text(input.uuid ?? input.id),
-    password: text(input.password),
-    username: text(input.username),
-    method: text(input.method, 'aes-256-gcm'),
-    encryption: text(input.encryption, 'none'),
-    flow: text(input.flow),
+    ...endpoint(
+      input.server ?? input.address,
+      input.serverPort ??
+        input.port ??
+        (protocol === 'ss' ? 8388 : protocol === 'socks' ? 1080 : 443),
+    ),
     network,
     security,
+    uuid: text(input.uuid ?? input.id),
+    password: String(input.password ?? ''),
+    username: String(input.username ?? ''),
+    method: text(input.method, 'aes-256-gcm'),
+    encryption: text(input.encryption, protocol === 'vmess' ? 'auto' : 'none'),
+    flow: text(input.flow),
     sni: text(input.sni),
     fingerprint: text(input.fingerprint, 'chrome'),
-    allowInsecure: Boolean(input.allowInsecure),
     realityPublicKey: text(input.realityPublicKey ?? input.publicKey),
     realityShortId: text(input.realityShortId ?? input.shortId),
+    spiderX: text(input.spiderX, '/'),
     path: text(input.path, '/'),
     host: text(input.host),
     serviceName: text(input.serviceName),
-    upMbps: Math.max(0, Number(input.upMbps ?? 0) || 0),
-    downMbps: Math.max(0, Number(input.downMbps ?? 0) || 0),
+    authority: text(input.authority),
+    multiMode: !!input.multiMode,
+    xhttpMode: text(input.xhttpMode, 'auto'),
+    xhttpExtra: '',
+    alpn: text(input.alpn),
+    pinnedPeerCertSha256: text(input.pinnedPeerCertSha256),
+    verifyPeerCertByName: text(input.verifyPeerCertByName),
+    upMbps: Number(input.upMbps ?? 0),
+    downMbps: Number(input.downMbps ?? 0),
     obfs: text(input.obfs),
-    obfsPassword: text(input.obfsPassword),
+    obfsPassword: String(input.obfsPassword ?? ''),
   };
-
-  if (['vless', 'vmess'].includes(protocol) && !config.uuid)
-    throw new Error(`${protocol.toUpperCase()} nodes require a UUID.`);
-  if (['trojan', 'hysteria2'].includes(protocol) && !config.password)
-    throw new Error(`${protocol.toUpperCase()} nodes require a password.`);
-  if (protocol === 'ss' && (!config.method || !config.password))
-    throw new Error(
-      'Shadowsocks nodes require an encryption method and password.',
-    );
-  if (security === 'reality' && !config.realityPublicKey)
-    throw new Error('Reality nodes require a public key.');
+  if (network === 'xhttp') {
+    if (
+      !['auto', 'stream-up', 'stream-one', 'packet-up'].includes(
+        config.xhttpMode,
+      )
+    )
+      throw new Error('Unsupported XHTTP mode.');
+    if (input.xhttpExtra && text(input.xhttpExtra))
+      config.xhttpExtra = JSON.stringify(
+        jsonObject(input.xhttpExtra, 'XHTTP extra'),
+      );
+  }
+  if (['vless', 'vmess'].includes(protocol)) required(config.uuid, 'UUID');
+  if (['trojan', 'hysteria2', 'ss'].includes(protocol))
+    required(config.password, 'Node password');
+  if (security === 'reality')
+    required(config.realityPublicKey, 'Reality public key');
+  if (protocol === 'hysteria2') {
+    if (security !== 'tls') throw new Error('Hysteria2 requires TLS.');
+    if (config.obfs && config.obfs !== 'salamander')
+      throw new Error('Unsupported Hysteria2 obfuscation.');
+    if (config.obfs) required(config.obfsPassword, 'Obfuscation password');
+    if (
+      [config.upMbps, config.downMbps].some((n) => !Number.isFinite(n) || n < 0)
+    )
+      throw new Error('Invalid Hysteria2 bandwidth.');
+  }
   return config;
 }
-
-function object(value) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value
-    : {};
-}
-
-function firstProxyOutbound(value) {
-  if (Array.isArray(value))
-    return value.find(
-      (item) =>
-        item &&
-        !['direct', 'block', 'dns', 'freedom', 'blackhole'].includes(
-          item.type ?? item.protocol,
-        ),
-    );
-  if (Array.isArray(value?.outbounds))
-    return firstProxyOutbound(value.outbounds);
-  return value;
-}
-
-function normalizeSingBox(raw) {
-  const protocol = normalizeProtocol(raw.type);
-  const server = requireText(raw.server, 'The JSON object is missing server.');
-  const serverPort = port(
-    raw.server_port ?? raw.serverPort,
-    protocol === 'ss' ? 8388 : 443,
-  );
-  return {
-    protocol,
-    server,
-    serverPort,
-    tag: text(raw.tag),
-    payload: {
-      kind: 'singbox',
-      outbound: {
-        ...raw,
-        type: protocol === 'ss' ? 'shadowsocks' : protocol,
-        server,
-        server_port: serverPort,
-      },
-    },
-  };
-}
-
-function normalizeXray(raw) {
-  const protocol = normalizeProtocol(raw.protocol);
-  const settings = object(raw.settings);
-  const stream = object(raw.streamSettings);
-  let endpoint = settings;
-  let user = settings;
-
-  if (['vless', 'vmess'].includes(protocol)) {
-    endpoint = object(
-      Array.isArray(settings.vnext) ? settings.vnext[0] : settings,
-    );
-    user = object(Array.isArray(endpoint.users) ? endpoint.users[0] : settings);
-  } else if (Array.isArray(settings.servers)) {
-    endpoint = object(settings.servers[0]);
-    user = endpoint;
+export function manualToXray(input, tag) {
+  const c = normalizeManualConfig(input);
+  const settings = { address: c.server, port: c.serverPort };
+  const streamSettings = { network: c.network, security: c.security };
+  switch (c.protocol) {
+    case 'vless':
+      Object.assign(settings, {
+        id: c.uuid,
+        encryption: c.encryption || 'none',
+        flow: c.flow,
+      });
+      break;
+    case 'vmess':
+      Object.assign(settings, { id: c.uuid, security: c.encryption });
+      break;
+    case 'ss':
+      Object.assign(settings, { method: c.method, password: c.password });
+      break;
+    case 'trojan':
+      settings.password = c.password;
+      break;
+    case 'socks':
+      Object.assign(settings, { user: c.username, pass: c.password });
+      break;
+    case 'hysteria2':
+      settings.version = 2;
+      streamSettings.network = 'hysteria';
+      streamSettings.hysteriaSettings = { version: 2, auth: c.password };
+      if (c.obfs || c.upMbps || c.downMbps) {
+        streamSettings.finalmask = {};
+        if (c.obfs)
+          streamSettings.finalmask.udp = [
+            { type: c.obfs, settings: { password: c.obfsPassword } },
+          ];
+        if (c.upMbps || c.downMbps)
+          streamSettings.finalmask.quicParams = {
+            congestion: 'brutal',
+            brutalUp: c.upMbps ? c.upMbps + 'mbps' : undefined,
+            brutalDown: c.downMbps ? c.downMbps + 'mbps' : undefined,
+          };
+      }
+      break;
   }
-
-  const tls = object(stream.tlsSettings);
-  const reality = object(stream.realitySettings);
-  const ws = object(stream.wsSettings);
-  const grpc = object(stream.grpcSettings);
-  const httpUpgrade = object(stream.httpupgradeSettings);
-  const headers = object(ws.headers ?? httpUpgrade.headers);
-  const manual = normalizeManualConfig({
-    protocol,
-    server: endpoint.address ?? endpoint.server,
-    serverPort: endpoint.port,
-    uuid: user.id,
-    password: user.password,
-    username: user.user ?? user.username,
-    method: user.method,
-    encryption: user.encryption,
-    flow: user.flow,
-    network: stream.network ?? 'tcp',
-    security: stream.security ?? 'none',
-    sni: tls.serverName ?? reality.serverName,
-    fingerprint: tls.fingerprint ?? reality.fingerprint,
-    allowInsecure: tls.allowInsecure,
-    realityPublicKey: reality.publicKey,
-    realityShortId: reality.shortId,
-    path: ws.path ?? httpUpgrade.path,
-    host: headers.Host ?? headers.host,
-    serviceName: grpc.serviceName,
-  });
-  return {
-    protocol,
-    server: manual.server,
-    serverPort: manual.serverPort,
-    tag: text(raw.tag),
-    payload: { kind: 'manual', config: manual, original: raw },
-  };
-}
-
-export function normalizeJsonConfig(value) {
-  let parsed;
-  try {
-    parsed = typeof value === 'string' ? JSON.parse(value) : value;
-  } catch {
-    throw new Error('Outbound JSON is invalid.');
-  }
-  const raw = firstProxyOutbound(parsed);
-  if (!raw || typeof raw !== 'object')
-    throw new Error('No usable proxy outbound was found in the JSON.');
-  if (raw.type) return normalizeSingBox(raw);
-  if (raw.protocol) return normalizeXray(raw);
-  throw new Error(
-    'Unrecognized JSON format; provide a sing-box type or Xray protocol field.',
-  );
-}
-
-export function manualToSingBox(config, tag) {
-  const outbound = {
-    type: config.protocol === 'ss' ? 'shadowsocks' : config.protocol,
-    tag,
-    server: config.server,
-    server_port: config.serverPort,
-  };
-  if (config.protocol === 'vless')
-    Object.assign(outbound, {
-      uuid: config.uuid,
-      flow: config.flow || undefined,
-    });
-  if (config.protocol === 'vmess')
-    Object.assign(outbound, {
-      uuid: config.uuid,
-      security: config.encryption === 'none' ? 'auto' : config.encryption,
-    });
-  if (config.protocol === 'ss')
-    Object.assign(outbound, {
-      method: config.method,
-      password: config.password,
-    });
-  if (config.protocol === 'trojan') outbound.password = config.password;
-  if (config.protocol === 'hysteria2')
-    Object.assign(outbound, {
-      password: config.password,
-      up_mbps: config.upMbps || undefined,
-      down_mbps: config.downMbps || undefined,
-      obfs: config.obfs
-        ? { type: config.obfs, password: config.obfsPassword }
-        : undefined,
-    });
-  if (config.protocol === 'socks')
-    Object.assign(outbound, {
-      username: config.username || undefined,
-      password: config.password || undefined,
-    });
-
-  if (
-    ['vless', 'vmess', 'trojan'].includes(config.protocol) &&
-    config.network !== 'tcp'
-  ) {
-    outbound.transport = { type: config.network };
-    if (['ws', 'httpupgrade'].includes(config.network)) {
-      outbound.transport.path = config.path || '/';
-      if (config.host) outbound.transport.headers = { Host: config.host };
-    }
-    if (config.network === 'grpc')
-      outbound.transport.service_name = config.serviceName;
-  }
-  if (
-    config.security !== 'none' ||
-    ['trojan', 'hysteria2'].includes(config.protocol)
-  ) {
-    outbound.tls = {
-      enabled: true,
-      server_name: config.sni || config.server,
-      insecure: Boolean(config.allowInsecure),
-      utls: config.fingerprint
-        ? { enabled: true, fingerprint: config.fingerprint }
-        : undefined,
+  if (['ws', 'httpupgrade'].includes(c.network))
+    streamSettings[c.network + 'Settings'] = { path: c.path, host: c.host };
+  if (c.network === 'grpc')
+    streamSettings.grpcSettings = {
+      serviceName: c.serviceName,
+      authority: c.authority,
+      multiMode: c.multiMode,
     };
-    if (config.security === 'reality') {
-      outbound.tls.reality = {
-        enabled: true,
-        public_key: config.realityPublicKey,
-        short_id: config.realityShortId || undefined,
-      };
-    }
-  }
-  return outbound;
+  if (c.network === 'xhttp')
+    streamSettings.xhttpSettings = {
+      ...JSON.parse(c.xhttpExtra || '{}'),
+      path: c.path,
+      host: c.host,
+      mode: c.xhttpMode,
+    };
+  if (c.security === 'tls')
+    streamSettings.tlsSettings = {
+      serverName: c.sni || c.server,
+      fingerprint:
+        c.protocol === 'hysteria2' ? undefined : c.fingerprint || undefined,
+      alpn: c.alpn
+        ? c.alpn.split(',').map((v) => v.trim())
+        : c.protocol === 'hysteria2'
+          ? ['h3']
+          : undefined,
+      pinnedPeerCertSha256: c.pinnedPeerCertSha256 || undefined,
+      verifyPeerCertByName: c.verifyPeerCertByName || undefined,
+    };
+  if (c.security === 'reality')
+    streamSettings.realitySettings = {
+      serverName: c.sni || c.server,
+      fingerprint: c.fingerprint || 'chrome',
+      password: c.realityPublicKey,
+      shortId: c.realityShortId,
+      spiderX: c.spiderX || '/',
+    };
+  const protocol =
+    c.protocol === 'ss'
+      ? 'shadowsocks'
+      : c.protocol === 'hysteria2'
+        ? 'hysteria'
+        : c.protocol;
+  return { tag, protocol, settings, streamSettings };
 }
 
-function decodeBase64(value) {
-  const normalized = value.replaceAll('-', '+').replaceAll('_', '/');
-  return Buffer.from(
-    normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '='),
-    'base64',
-  ).toString('utf8');
+function decode64(s) {
+  return Buffer.from(s, 'base64url').toString('utf8');
 }
 
-function linkParameters(uri, protocol, server, serverPort) {
-  const network =
-    uri.searchParams.get('type') || uri.searchParams.get('network') || 'tcp';
-  const security =
-    uri.searchParams.get('security') ||
-    (protocol === 'trojan' || protocol === 'hysteria2' ? 'tls' : 'none');
-  return {
-    protocol,
-    server,
-    serverPort,
-    uuid: decodeURIComponent(uri.username),
-    password: decodeURIComponent(uri.username),
-    network,
-    security,
-    flow: uri.searchParams.get('flow') || '',
-    sni: uri.searchParams.get('sni') || uri.searchParams.get('peer') || '',
-    fingerprint: uri.searchParams.get('fp') || 'chrome',
-    allowInsecure: ['1', 'true'].includes(
-      uri.searchParams.get('allowInsecure') ||
-        uri.searchParams.get('insecure') ||
-        '',
-    ),
-    realityPublicKey:
-      uri.searchParams.get('pbk') || uri.searchParams.get('publicKey') || '',
-    realityShortId:
-      uri.searchParams.get('sid') || uri.searchParams.get('shortId') || '',
-    path: uri.searchParams.get('path') || '/',
-    host: uri.searchParams.get('host') || '',
-    serviceName: uri.searchParams.get('serviceName') || '',
-    obfs: uri.searchParams.get('obfs') || '',
-    obfsPassword:
-      uri.searchParams.get('obfs-password') ||
-      uri.searchParams.get('obfsPassword') ||
-      '',
-    upMbps: Number(
-      uri.searchParams.get('upmbps') || uri.searchParams.get('up') || 0,
-    ),
-    downMbps: Number(
-      uri.searchParams.get('downmbps') || uri.searchParams.get('down') || 0,
-    ),
-  };
-}
-
-export function linkToSingBox(value, tag) {
-  const source = text(value);
-  const protocolText = source.split('://')[0]?.toLowerCase();
-  const protocol = normalizeProtocol(protocolText);
-
+export function parseShareLink(value) {
+  let uri = text(value);
+  if (/^[a-z0-9]+\\:\/\//i.test(uri))
+    uri = uri.replaceAll('\\:', ':').replaceAll('\\.', '.').replace(/\\$/, '');
+  const match = /^([a-z0-9]+):\/\//i.exec(uri);
+  if (!match) throw new Error('Invalid proxy share link.');
+  const protocol = protocolOf(match[1]);
+  let config, label;
   if (protocol === 'vmess') {
     let raw;
     try {
-      raw = JSON.parse(
-        decodeBase64(source.slice('vmess://'.length).split('#')[0]),
-      );
+      raw = JSON.parse(decode64(uri.slice(match[0].length).split('#')[0]));
     } catch {
-      throw new Error('The VMess share link is invalid.');
+      throw new Error('Invalid VMess share link.');
     }
-    return manualToSingBox(
-      normalizeManualConfig({
-        protocol,
-        server: raw.add,
-        serverPort: raw.port,
-        uuid: raw.id,
-        encryption: raw.scy || 'auto',
-        network: raw.net || 'tcp',
-        security:
-          raw.tls === 'tls'
-            ? 'tls'
-            : raw.tls === 'reality'
-              ? 'reality'
-              : 'none',
-        sni: raw.sni,
-        fingerprint: raw.fp,
-        path: raw.path,
-        host: raw.host,
-        serviceName: raw.path,
-        realityPublicKey: raw.pbk,
-        realityShortId: raw.sid,
-      }),
-      tag,
-    );
-  }
-
-  if (protocol === 'ss') {
-    const withoutFragment = source.split('#')[0];
-    const payload = withoutFragment.slice('ss://'.length);
-    let methodPassword;
-    let hostPort;
-    if (payload.includes('@')) {
-      const index = payload.lastIndexOf('@');
-      const encodedUser = payload.slice(0, index);
-      methodPassword = encodedUser.includes(':')
-        ? decodeURIComponent(encodedUser)
-        : decodeBase64(encodedUser);
-      hostPort = payload.slice(index + 1);
-    } else {
-      const decoded = decodeBase64(payload);
-      const index = decoded.lastIndexOf('@');
-      methodPassword = decoded.slice(0, index);
-      hostPort = decoded.slice(index + 1);
+    config = {
+      protocol,
+      server: raw.add,
+      serverPort: raw.port,
+      uuid: raw.id,
+      encryption: raw.scy || 'auto',
+      network: raw.net,
+      security: raw.tls || 'none',
+      sni: raw.sni,
+      fingerprint: raw.fp,
+      path: raw.path,
+      host: raw.host,
+      serviceName: raw.path,
+      realityPublicKey: raw.pbk,
+      realityShortId: raw.sid,
+      spiderX: raw.spx,
+      xhttpMode: raw.mode,
+      xhttpExtra: raw.extra,
+      alpn: raw.alpn,
+    };
+    label = raw.ps;
+  } else {
+    let address = uri;
+    let ss;
+    if (protocol === 'ss') {
+      const payload = uri.slice(match[0].length).split(/[?#]/)[0];
+      const decoded = payload.includes('@') ? payload : decode64(payload);
+      const at = decoded.lastIndexOf('@');
+      if (at < 1) throw new Error('Invalid Shadowsocks endpoint.');
+      const user = decoded.slice(0, at);
+      const auth = !payload.includes('@')
+        ? user
+        : user.includes(':') || /%3a/i.test(user)
+          ? decodeURIComponent(user)
+          : decode64(user);
+      const sep = auth.indexOf(':');
+      if (sep <= 0) throw new Error('Invalid Shadowsocks credentials.');
+      ss = { method: auth.slice(0, sep), password: auth.slice(sep + 1) };
+      address =
+        'ss://' +
+        decoded.slice(at + 1) +
+        uri.slice(match[0].length + payload.length);
     }
-    const separator = methodPassword.indexOf(':');
-    const endpoint = new URL(`tcp://${hostPort}`);
-    return manualToSingBox(
-      normalizeManualConfig({
-        protocol,
-        server: endpoint.hostname,
-        serverPort: endpoint.port || 8388,
-        method: methodPassword.slice(0, separator),
-        password: methodPassword.slice(separator + 1),
-      }),
-      tag,
-    );
+    let url;
+    try {
+      url = new URL(address);
+    } catch {
+      throw new Error('Invalid share-link address.');
+    }
+    const p = url.searchParams;
+    if (
+      p.has('plugin') ||
+      p.has('mport') ||
+      p.has('fm') ||
+      (p.has('headerType') && p.get('headerType') !== 'none')
+    )
+      throw new Error(
+        'Unsupported share-link extension. Import its native Xray outbound JSON.',
+      );
+    const user = decodeURIComponent(url.username);
+    const pass = decodeURIComponent(url.password);
+    config = {
+      protocol,
+      server: url.hostname,
+      serverPort: url.port || undefined,
+      uuid: user,
+      username: user,
+      password: protocol === 'socks' ? pass : pass ? user + ':' + pass : user,
+      ...ss,
+      network: p.get('type') || p.get('network'),
+      security: p.get('security'),
+      encryption: p.get('encryption') || undefined,
+      sni: p.get('sni') || p.get('peer'),
+      fingerprint: p.get('fp'),
+      flow: p.get('flow'),
+      realityPublicKey: p.get('pbk') || p.get('publicKey'),
+      realityShortId: p.get('sid') || p.get('shortId'),
+      spiderX: p.get('spx'),
+      alpn: p.get('alpn'),
+      pinnedPeerCertSha256: p.get('pcs') || p.get('pinSHA256'),
+      verifyPeerCertByName: p.get('vcn'),
+      allowInsecure: ['1', 'true'].includes(
+        p.get('allowInsecure') || p.get('insecure'),
+      ),
+      host: p.get('host'),
+      path: p.get('path'),
+      serviceName: p.get('serviceName') || p.get('path'),
+      authority: p.get('authority'),
+      multiMode: p.get('mode') === 'multi',
+      xhttpMode: p.get('mode') || undefined,
+      xhttpExtra: p.get('extra'),
+      upMbps: p.get('upmbps') || p.get('up'),
+      downMbps: p.get('downmbps') || p.get('down'),
+      obfs: p.get('obfs'),
+      obfsPassword: p.get('obfs-password') || p.get('obfsPassword'),
+    };
+    if (['xhttp', 'splithttp'].includes(config.network)) {
+      const extra = {
+        ...(config.xhttpExtra
+          ? jsonObject(config.xhttpExtra, 'XHTTP extra')
+          : {}),
+      };
+      for (const key of [
+        'xPaddingBytes',
+        'scMaxEachPostBytes',
+        'scMinPostsIntervalMs',
+        'scStreamUpServerSecs',
+      ])
+        if (p.has(key)) extra[key] = p.get(key);
+      config.xhttpExtra = extra;
+    }
+    label = decodeURIComponent(url.hash.slice(1));
   }
+  return { config: normalizeManualConfig(config), label: text(label), uri };
+}
 
-  const uri = new URL(source);
-  const config = linkParameters(
-    uri,
-    protocol,
-    uri.hostname,
-    Number(uri.port || (protocol === 'socks' ? 1080 : 443)),
+// Reject unmapped legacy options instead of silently changing the route or TLS policy.
+function fields(object, allowed, section) {
+  const unknown = Object.keys(object).find((key) => !allowed.includes(key));
+  if (unknown)
+    throw new Error(
+      'Unsupported sing-box ' +
+        section +
+        ' field: ' +
+        unknown +
+        '. Import native Xray JSON.',
+    );
+}
+export function convertLegacyOutbound(raw, tag) {
+  fields(
+    raw,
+    [
+      'type',
+      'tag',
+      'server',
+      'server_port',
+      'uuid',
+      'security',
+      'flow',
+      'password',
+      'username',
+      'method',
+      'tls',
+      'transport',
+      'up_mbps',
+      'down_mbps',
+      'obfs',
+      'version',
+    ],
+    'outbound',
   );
-  if (protocol === 'socks') {
-    config.username = decodeURIComponent(uri.username);
-    config.password = decodeURIComponent(uri.password);
+  const tls = raw.tls ?? {},
+    reality = tls.reality ?? {},
+    utls = tls.utls ?? {},
+    tr = raw.transport ?? {},
+    obfs = raw.obfs ?? {};
+  fields(
+    tls,
+    ['enabled', 'server_name', 'alpn', 'insecure', 'utls', 'reality'],
+    'TLS',
+  );
+  fields(utls, ['enabled', 'fingerprint'], 'uTLS');
+  fields(reality, ['enabled', 'public_key', 'short_id'], 'Reality');
+  fields(tr, ['type', 'path', 'headers', 'host', 'service_name'], 'transport');
+  fields(obfs, ['type', 'password'], 'obfuscation');
+  if (raw.version && String(raw.version) !== '5')
+    throw new Error('Unsupported SOCKS version.');
+  const headers = { ...tr.headers };
+  const hostKey = Object.keys(headers).find(
+    (key) => key.toLowerCase() === 'host',
+  );
+  const host = tr.host || headers[hostKey];
+  delete headers[hostKey];
+  const outbound = manualToXray(
+    {
+      protocol: raw.type,
+      server: raw.server,
+      serverPort: raw.server_port,
+      uuid: raw.uuid,
+      password: raw.password,
+      method: raw.method,
+      username: raw.username,
+      encryption: raw.security,
+      flow: raw.flow,
+      security: tls.enabled ? (reality.enabled ? 'reality' : 'tls') : 'none',
+      sni: tls.server_name,
+      alpn: tls.alpn?.join(','),
+      fingerprint: utls.enabled ? utls.fingerprint : '',
+      allowInsecure: tls.insecure,
+      realityPublicKey: reality.public_key,
+      realityShortId: reality.short_id,
+      network: tr.type,
+      host,
+      path: tr.path,
+      serviceName: tr.service_name,
+      upMbps: raw.up_mbps,
+      downMbps: raw.down_mbps,
+      obfs: obfs.type,
+      obfsPassword: obfs.password,
+    },
+    tag,
+  );
+  if (Object.keys(headers).length) {
+    if (!['ws', 'httpupgrade'].includes(tr.type))
+      throw new Error('Unsupported transport headers.');
+    outbound.streamSettings[tr.type + 'Settings'].headers = headers;
   }
-  return manualToSingBox(normalizeManualConfig(config), tag);
+  return outbound;
+}
+export function normalizeJsonConfig(input) {
+  let raw = input;
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      throw new Error('Outbound JSON is invalid.');
+    }
+  }
+  const list = Array.isArray(raw) ? raw : raw?.outbounds;
+  if (Array.isArray(list)) {
+    const proxies = list.filter(
+      (o) =>
+        o &&
+        !['direct', 'freedom', 'block', 'blackhole', 'dns'].includes(
+          o.protocol ?? o.type,
+        ),
+    );
+    if (proxies.length !== 1)
+      throw new Error('A node requires exactly one proxy outbound.');
+    raw = proxies[0];
+  }
+  raw = jsonObject(raw, 'Outbound');
+  const outbound = raw.protocol ? raw : convertLegacyOutbound(raw, raw.tag);
+  const protocol = protocolOf(outbound.protocol);
+  if (
+    outbound.proxySettings?.tag ||
+    outbound.streamSettings?.sockopt?.dialerProxy
+  )
+    throw new Error(
+      'A node requires a standalone outbound without references to other proxy tags.',
+    );
+  const settings = jsonObject(outbound.settings, 'Outbound settings');
+  const target = settings.address
+    ? settings
+    : (settings.vnext?.[0] ?? settings.servers?.[0] ?? settings);
+  return {
+    protocol,
+    ...endpoint(target.address, target.port),
+    tag: text(raw.tag),
+    payload: { kind: raw.protocol ? 'xray' : 'singbox', outbound: raw },
+  };
+}
+
+export function savedManualConfig(saved) {
+  // The v0.1.1 manual renderer always enabled TLS for Trojan.
+  const c = saved.config;
+  if (saved.core !== 'xray' && c.protocol === 'trojan' && c.security === 'none')
+    return { ...c, security: 'tls' };
+  return c;
+}
+
+export function nodeOutbound(node) {
+  const tag = 'out-' + node.id;
+  const saved = node.stored_config;
+  // Previous versions stored Xray JSON with a lossy manual projection and a complete original.
+  if (saved?.original || saved?.kind === 'xray') {
+    const raw = saved.original ?? saved.outbound;
+    normalizeJsonConfig(raw);
+    return { ...raw, tag };
+  }
+  if (saved?.kind === 'singbox')
+    return convertLegacyOutbound(saved.outbound, tag);
+  if (saved?.kind === 'manual')
+    return manualToXray(savedManualConfig(saved), tag);
+  return manualToXray(parseShareLink(node.uri).config, tag);
 }

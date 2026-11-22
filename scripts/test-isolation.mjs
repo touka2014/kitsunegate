@@ -125,7 +125,20 @@ try {
   );
   const report = await api('/nodes/' + node.id + '/test', 'POST');
   assert.equal(report.probe.statusCode, 204);
+  await api('/groups/grp_us', 'PUT', {
+    mode: 'fallback',
+    probeUrls: [checkUrl],
+    riseThreshold: 1,
+  });
+  const usNode = await api(
+    '/groups/grp_us/nodes',
+    'POST',
+    { uri: 'socks://127.0.0.1:' + proxyPort },
+    201,
+  );
+  const usConfig = await api('/nodes/' + usNode.id + '/config');
   const before = await state();
+  const originalUS = before.groups.find((g) => g.id === 'grp_us');
   curl = spawn('curl', [
     '--silent',
     '--show-error',
@@ -158,8 +171,13 @@ try {
     assert.equal(after.engine.configPath, before.engine.configPath);
     assert.equal(after.engine.status, 'running');
     const us = after.groups.find((g) => g.id === 'grp_us');
-    assert.equal(us.listenPort, 1188);
-    assert.equal(us.nodes.length, 0);
+    assert.equal(us.updatedAt, originalUS.updatedAt);
+    assert.equal(us.listenPort, originalUS.listenPort);
+    assert.equal(us.mode, originalUS.mode);
+    assert.equal(us.algorithm, originalUS.algorithm);
+    assert.deepEqual(us.probeUrls, originalUS.probeUrls);
+    assert.deepEqual(us.nodes.map((n) => n.id), [usNode.id]);
+    assert.deepEqual(await api('/nodes/' + usNode.id + '/config'), usConfig);
     assert.ok(receivedBytes > initial, label + ' stalled');
     console.log(
       label,
@@ -171,19 +189,28 @@ try {
   await rejected('Missing Reality key', '/groups/grp_us/nodes', 'POST', {
     uri: 'vless://id@example.org:443?security=reality',
   });
-  await rejected('sing-box binary validation', '/groups/grp_us/nodes', 'POST', {
+  await rejected('Xray binary validation', '/groups/grp_us/nodes', 'POST', {
     sourceType: 'json',
     json: {
-      type: 'socks',
-      server: '127.0.0.1',
-      server_port: proxyPort,
-      invalid_field_for_test: true,
+      protocol: 'socks',
+      settings: { address: '127.0.0.1', port: proxyPort },
+      streamSettings: { network: 'invalid-transport' },
     },
   });
   await rejected('Occupied US listener', '/groups/grp_us', 'PUT', {
     listenHost: '127.0.0.1',
     listenPort: targetPort,
   });
+  for (const [field, value] of [
+    ['mode', 'unknown'],
+    ['algorithm', 'unknown'],
+    ['probeUrls', checkUrl],
+    ['selectedNodeId', node.id],
+  ]) {
+    await rejected('Invalid US ' + field, '/groups/grp_us', 'PUT', {
+      [field]: value,
+    });
+  }
   // Also exercise concurrent accepted saves and draining across a successful handoff.
   await Promise.all([
     api('/groups/grp_us', 'PUT', { name: 'US saved' }),

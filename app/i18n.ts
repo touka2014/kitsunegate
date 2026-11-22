@@ -22,6 +22,25 @@ type LocalizedValues = [
 ];
 
 const phrases: Record<string, LocalizedValues> = {
+  'XHTTP 模式': ['XHTTP mode', 'XHTTP モード', 'Mode XHTTP', 'XHTTP 모드'],
+  'XHTTP 扩展参数（JSON）': [
+    'XHTTP extra settings (JSON)',
+    'XHTTP 追加設定（JSON）',
+    'Paramètres XHTTP avancés (JSON)',
+    'XHTTP 추가 설정 (JSON)',
+  ],
+  '证书 SHA-256 指纹（可选）': [
+    'Certificate SHA-256 pin (optional)',
+    '証明書 SHA-256 ピン（任意）',
+    'Empreinte SHA-256 du certificat (facultative)',
+    '인증서 SHA-256 지문 (선택)',
+  ],
+  '导入一个 Xray 或 3x-ui 出站。旧版 sing-box JSON 会在保存时检查兼容性。': [
+    'Import one Xray or 3x-ui outbound. Legacy sing-box JSON is checked for compatibility on save.',
+    'Xray または 3x-ui のアウトバウンドを1件読み込みます。旧 sing-box JSON は保存時に互換性を確認します。',
+    'Importez une sortie Xray ou 3x-ui. La compatibilité des anciens JSON sing-box est vérifiée à l’enregistrement.',
+    'Xray 또는 3x-ui 아웃바운드 하나를 가져옵니다. 기존 sing-box JSON의 호환성은 저장 시 확인합니다.',
+  ],
   草稿试测: [
     'Test draft',
     '下書きをテスト',
@@ -130,6 +149,7 @@ const phrases: Record<string, LocalizedValues> = {
     'Ajoutez des nœuds via le formulaire, un JSON sortant ou un lien de partage.',
     '기본 양식, 아웃바운드 JSON 또는 공유 링크로 노드를 추가할 수 있습니다.',
   ],
+  已选择: ['Selected', '選択中', 'Sélectionné', '선택됨'],
   保存节点选择: [
     'Save node selection',
     'ノード選択を保存',
@@ -611,11 +631,11 @@ const phrases: Record<string, LocalizedValues> = {
     'Toutes les sources',
     '모든 소스',
   ],
-  '代理核心 · sing-box': [
-    'Proxy core · sing-box',
-    'プロキシコア · sing-box',
-    'Cœur proxy · sing-box',
-    '프록시 코어 · sing-box',
+  '代理核心 · Xray': [
+    'Proxy core · Xray',
+    'プロキシコア · Xray',
+    'Cœur proxy · Xray',
+    '프록시 코어 · Xray',
   ],
   '管理 API': ['Management API', '管理 API', 'API de gestion', '관리 API'],
   运行管理器: [
@@ -825,17 +845,17 @@ const phrases: Record<string, LocalizedValues> = {
     'Génération de la configuration…',
     '구성 생성 중…',
   ],
-  'sing-box 已接管流量；内置均衡器负责端口分流。': [
-    'sing-box handles proxy traffic; the built-in balancer routes listener ports.',
-    'sing-box がプロキシ通信を処理し、内蔵バランサーが待受ポートを振り分けます。',
-    'sing-box gère le trafic proxy ; l’équilibreur intégré distribue les ports d’écoute.',
-    'sing-box가 프록시 트래픽을 처리하고 내장 밸런서가 수신 포트를 분배합니다.',
+  'Xray 已接管流量；内置均衡器负责端口分流。': [
+    'Xray handles proxy traffic; the built-in balancer routes listener ports.',
+    'Xray がプロキシ通信を処理し、内蔵バランサーが待受ポートを振り分けます。',
+    'Xray gère le trafic proxy ; l’équilibreur intégré distribue les ports d’écoute.',
+    'Xray가 프록시 트래픽을 처리하고 내장 밸런서가 수신 포트를 분배합니다.',
   ],
-  'sing-box 已接管流量；HAProxy负责端口分流。': [
-    'sing-box handles proxy traffic; HAProxy routes listener ports.',
-    'sing-box がプロキシ通信を処理し、HAProxy が待受ポートを振り分けます。',
-    'sing-box gère le trafic proxy ; HAProxy distribue les ports d’écoute.',
-    'sing-box가 프록시 트래픽을 처리하고 HAProxy가 수신 포트를 분배합니다.',
+  'Xray 已接管流量；HAProxy负责端口分流。': [
+    'Xray handles proxy traffic; HAProxy routes listener ports.',
+    'Xray がプロキシ通信を処理し、HAProxy が待受ポートを振り分けます。',
+    'Xray gère le trafic proxy ; HAProxy distribue les ports d’écoute.',
+    'Xray가 프록시 트래픽을 처리하고 HAProxy가 수신 포트를 분배합니다.',
   ],
   'KitsuneGate 内置均衡器': [
     'KitsuneGate built-in balancer',
@@ -882,11 +902,11 @@ const phrases: Record<string, LocalizedValues> = {
     'Conservez de 1 à 30 jours. Les tendances utilisent automatiquement des intervalles de 5 secondes à 30 minutes.',
     '1~30일 보관할 수 있으며 기간에 따라 5초~30분 단위로 자동 집계합니다.',
   ],
-  '该等级同时应用到 sing-box 输出和 KitsuneGate 日志入库过滤。': [
-    'This level applies to sing-box output and KitsuneGate log storage.',
-    'このレベルは sing-box 出力と KitsuneGate のログ保存に適用されます。',
-    'Ce niveau s’applique à la sortie sing-box et au stockage des journaux KitsuneGate.',
-    '이 수준은 sing-box 출력과 KitsuneGate 로그 저장에 모두 적용됩니다.',
+  '该等级同时应用到 Xray 输出和 KitsuneGate 日志入库过滤。': [
+    'This level applies to Xray output and KitsuneGate log storage.',
+    'このレベルは Xray 出力と KitsuneGate のログ保存に適用されます。',
+    'Ce niveau s’applique à la sortie Xray et au stockage des journaux KitsuneGate.',
+    '이 수준은 Xray 출력과 KitsuneGate 로그 저장에 모두 적용됩니다.',
   ],
   '支持 1–90 天，后台每分钟清理过期记录。': [
     'Retain 1–90 days. Expired records are removed every minute.',
@@ -955,26 +975,26 @@ const phrases: Record<string, LocalizedValues> = {
     'Utilise uniquement le nœud choisi dans l’onglet Nœuds. La connexion échoue explicitement si ce nœud est indisponible.',
     '노드 탭에서 선택한 노드만 사용하며 해당 노드를 사용할 수 없으면 연결을 명확히 실패 처리합니다.',
   ],
-  '检测会经节点独立的 sing-box SOCKS 适配端口发起真实 HTTP/HTTPS 请求。失败与恢复阈值用于抑制偶发网络抖动。':
+  '检测会经节点独立的 Xray SOCKS 适配端口发起真实 HTTP/HTTPS 请求。失败与恢复阈值用于抑制偶发网络抖动。':
     [
-      'Checks send real HTTP/HTTPS requests through each node’s dedicated sing-box SOCKS adapter. Failure and recovery thresholds prevent brief network jitter from causing a switch.',
-      '各ノード専用の sing-box SOCKS アダプターを経由して実際の HTTP/HTTPS リクエストを送信します。失敗・復旧しきい値で一時的なネットワーク揺らぎによる切替を抑えます。',
-      'Les contrôles envoient de vraies requêtes HTTP/HTTPS via l’adaptateur SOCKS sing-box dédié de chaque nœud. Les seuils d’échec et de reprise évitent les bascules dues aux perturbations passagères.',
-      '각 노드의 전용 sing-box SOCKS 어댑터를 통해 실제 HTTP/HTTPS 요청을 보냅니다. 실패 및 복구 임계값은 일시적인 네트워크 흔들림으로 인한 전환을 방지합니다.',
+      'Checks send real HTTP/HTTPS requests through each node’s dedicated Xray SOCKS adapter. Failure and recovery thresholds prevent brief network jitter from causing a switch.',
+      '各ノード専用の Xray SOCKS アダプターを経由して実際の HTTP/HTTPS リクエストを送信します。失敗・復旧しきい値で一時的なネットワーク揺らぎによる切替を抑えます。',
+      'Les contrôles envoient de vraies requêtes HTTP/HTTPS via l’adaptateur SOCKS Xray dédié de chaque nœud. Les seuils d’échec et de reprise évitent les bascules dues aux perturbations passagères.',
+      '각 노드의 전용 Xray SOCKS 어댑터를 통해 실제 HTTP/HTTPS 요청을 보냅니다. 실패 및 복구 임계값은 일시적인 네트워크 흔들림으로 인한 전환을 방지합니다.',
     ],
-  '请求会通过每个节点自己的 sing-box SOCKS 适配端口访问检测地址，不再使用模拟结果。':
+  '请求会通过每个节点自己的 Xray SOCKS 适配端口访问检测地址，不再使用模拟结果。':
     [
-      'Requests reach the check URL through each node’s own sing-box SOCKS adapter; results are never simulated.',
-      '各ノード専用の sing-box SOCKS アダプター経由でチェック URL にアクセスし、模擬結果は使用しません。',
-      'Les requêtes atteignent l’URL de contrôle via l’adaptateur SOCKS sing-box de chaque nœud ; aucun résultat n’est simulé.',
-      '각 노드의 sing-box SOCKS 어댑터를 통해 검사 URL에 접속하며 모의 결과를 사용하지 않습니다.',
+      'Requests reach the check URL through each node’s own Xray SOCKS adapter; results are never simulated.',
+      '各ノード専用の Xray SOCKS アダプター経由でチェック URL にアクセスし、模擬結果は使用しません。',
+      'Les requêtes atteignent l’URL de contrôle via l’adaptateur SOCKS Xray de chaque nœud ; aucun résultat n’est simulé.',
+      '각 노드의 Xray SOCKS 어댑터를 통해 검사 URL에 접속하며 모의 결과를 사용하지 않습니다.',
     ],
-  'sing-box 配置已由真实核心加载。Windows 本地版使用内置 TCP 均衡器；HAProxy 配置为后续 Linux/Docker 部署保留。':
+  'Xray 配置已由真实核心加载。Windows 本地版使用内置 TCP 均衡器；HAProxy 配置为后续 Linux/Docker 部署保留。':
     [
-      'The live core has loaded the sing-box configuration. The Windows build uses the built-in TCP balancer; the HAProxy configuration is retained for Linux and Docker deployments.',
-      '実コアは sing-box 設定を読み込み済みです。Windows 版は内蔵 TCP バランサーを使用し、HAProxy 設定は Linux／Docker 配信用に保持されます。',
-      'Le cœur actif a chargé la configuration sing-box. La version Windows utilise l’équilibreur TCP intégré ; la configuration HAProxy est conservée pour les déploiements Linux et Docker.',
-      '실제 코어가 sing-box 구성을 불러왔습니다. Windows 버전은 내장 TCP 밸런서를 사용하며 HAProxy 구성은 Linux 및 Docker 배포용으로 유지됩니다.',
+      'The live core has loaded the Xray configuration. The Windows build uses the built-in TCP balancer; the HAProxy configuration is retained for Linux and Docker deployments.',
+      '実コアは Xray 設定を読み込み済みです。Windows 版は内蔵 TCP バランサーを使用し、HAProxy 設定は Linux／Docker 配信用に保持されます。',
+      'Le cœur actif a chargé la configuration Xray. La version Windows utilise l’équilibreur TCP intégré ; la configuration HAProxy est conservée pour les déploiements Linux et Docker.',
+      '실제 코어가 Xray 구성을 불러왔습니다. Windows 버전은 내장 TCP 밸런서를 사용하며 HAProxy 구성은 Linux 및 Docker 배포용으로 유지됩니다.',
     ],
   'HAProxy（部署预览）': [
     'HAProxy (deployment preview)',
@@ -982,11 +1002,11 @@ const phrases: Record<string, LocalizedValues> = {
     'HAProxy (aperçu du déploiement)',
     'HAProxy(배포 미리보기)',
   ],
-  'sing-box（当前运行）': [
-    'sing-box (currently running)',
-    'sing-box（現在稼働中）',
-    'sing-box (actuellement actif)',
-    'sing-box(현재 실행 중)',
+  'Xray（当前运行）': [
+    'Xray (currently running)',
+    'Xray（現在稼働中）',
+    'Xray (actuellement actif)',
+    'Xray(현재 실행 중)',
   ],
   代理组已创建: [
     'Proxy group created',
@@ -1048,11 +1068,11 @@ const phrases: Record<string, LocalizedValues> = {
     'Le moteur actif n’a pas démarré',
     '실제 엔진이 아직 시작되지 않음',
   ],
-  'sing-box 未就绪': [
-    'sing-box not ready',
-    'sing-box は準備できていません',
-    'sing-box n’est pas prêt',
-    'sing-box 준비되지 않음',
+  'Xray 未就绪': [
+    'Xray not ready',
+    'Xray は準備できていません',
+    'Xray n’est pas prêt',
+    'Xray 준비되지 않음',
   ],
   'HAProxy 前端': [
     'HAProxy frontends',
@@ -1160,12 +1180,12 @@ function translateDynamic(
   const index = localeIndexes[language];
   const rules: [RegExp, LocalizedValues][] = [
     [
-      /^(\d+) 个监听端口正在接管流量$/,
+      /^(\d+) 个监听端口已启用$/,
       [
-        '$1 listeners are carrying traffic',
-        '$1 個の待受ポートがトラフィックを処理中',
-        '$1 ports d’écoute transportent du trafic',
-        '$1개 수신 포트가 트래픽 처리 중',
+        'Enabled listeners · $1',
+        '有効な待受ポート · $1',
+        'Ports d’écoute activés · $1',
+        '활성 수신 포트 · $1',
       ],
     ],
     [/^(\d+) 条结果$/, ['$1 results', '$1 件', '$1 résultats', '$1개 결과']],

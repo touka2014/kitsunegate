@@ -5,7 +5,7 @@ import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { renderHAProxyConfig, renderSingBoxConfig } from './engine.mjs';
+import { renderHAProxyConfig, renderXrayConfig } from './engine.mjs';
 
 const exec = promisify(execFile);
 export function alive(child) {
@@ -63,6 +63,72 @@ async function processReady(child, options) {
   throw new Error('Candidate process readiness timed out.');
 }
 
+class InvalidXrayConfig extends Error {}
+async function checkXray(binary, filename) {
+  try {
+    await exec(binary, ['run', '-test', '-config', filename], {
+      cwd: path.dirname(filename),
+      windowsHide: true,
+      timeout: 15000,
+    });
+  } catch (error) {
+    // Core diagnostics can echo the invalid key or password, including on stdout.
+    if (error.code === 23) {
+      const diagnostic = String(error.stdout) + String(error.stderr);
+      const field = [
+        'allowInsecure',
+        'fingerprint',
+        'shortId',
+        'spiderX',
+        'xPaddingBytes',
+        'password',
+        'encryption',
+        'transport',
+        'UUID',
+      ].find((key) => diagnostic.toLowerCase().includes(key.toLowerCase()));
+      throw new InvalidXrayConfig(
+        'Configuration rejected by Xray. Check ' +
+          (field ?? 'protocol, transport and security settings') +
+          '.',
+      );
+    }
+    throw error;
+  }
+}
+
+export async function inspectUpgrade(groups, binary, directory) {
+  if (!binary)
+    throw new Error('Xray is missing. Install the proxy core first.');
+  const dir = fs.mkdtempSync(path.join(directory, 'upgrade-'));
+  const file = path.join(dir, 'check.json');
+  const rejected = [];
+  try {
+    fs.writeFileSync(file, renderXrayConfig([]), { mode: 0o600 });
+    await checkXray(binary, file);
+    for (const node of groups
+      .flatMap((g) => g.nodes)
+      .filter((n) => n.enabled)) {
+      let config;
+      try {
+        config = renderXrayConfig([{ enabled: true, nodes: [node] }]);
+      } catch (error) {
+        rejected.push({ node, reason: error.message });
+        continue;
+      }
+      fs.writeFileSync(file, config, { mode: 0o600 });
+      try {
+        await checkXray(binary, file);
+      } catch (error) {
+        if (!(error instanceof InvalidXrayConfig)) throw error;
+        rejected.push({ node, reason: error.message });
+      }
+    }
+    return rejected;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export async function prepare(groups, options) {
   const {
     directory,
@@ -75,7 +141,7 @@ export async function prepare(groups, options) {
     onExit,
   } = options;
   if (!binary)
-    throw new Error('sing-box is missing. Install the proxy core first.');
+    throw new Error('Xray is missing. Install the proxy core first.');
   const dir = fs.mkdtempSync(path.join(directory, 'gen-'));
   const gen = {
     dir,
@@ -107,35 +173,37 @@ export async function prepare(groups, options) {
     const used = new Set(
       groups.filter((g) => g.enabled).map((g) => g.listen_port),
     );
-    if (
-      groups.some((g) =>
-        g.nodes.some((n) => n.enabled && used.has(n.adapter_port)),
-      )
-    )
-      throw new Error('Listener port conflicts with a node adapter.');
     const active = groups.filter((g) => g.enabled);
     for (const group of active)
       for (const node of group.nodes.filter((n) => n.enabled)) {
-        if (previous) {
-          // Reserve all temporary ports together so two adapters cannot receive the same port.
-          let port;
-          do {
-            const server = net.createServer();
-            await listen(server, 0, '127.0.0.1');
-            reserved.push(server);
-            port = server.address().port;
-          } while (used.has(port));
-          node.adapter_port = port;
+        let preferred =
+          !previous && !used.has(node.adapter_port) ? node.adapter_port : 0;
+        while (true) {
+          const server = net.createServer();
+          try {
+            await listen(server, preferred, '127.0.0.1');
+          } catch (error) {
+            if (!preferred || error.code !== 'EADDRINUSE') throw error;
+            preferred = 0;
+            continue;
+          }
+          reserved.push(server);
+          const port = server.address().port;
+          if (!used.has(port)) {
+            node.adapter_port = port;
+            break;
+          }
+          preferred = 0;
         }
         gen.ports.set(node.id, node.adapter_port);
       }
-    gen.singConfig = renderSingBoxConfig(groups, { logLevel });
-    gen.coreFile = path.join(dir, 'sing-box.json');
-    fs.writeFileSync(gen.coreFile, gen.singConfig, { mode: 0o600 });
+    gen.coreConfig = renderXrayConfig(groups, { logLevel });
+    gen.coreFile = path.join(dir, 'xray.json');
+    fs.writeFileSync(gen.coreFile, gen.coreConfig, { mode: 0o600 });
     const check = async (bin, args) =>
       exec(bin, args, { windowsHide: true, cwd: dir, timeout: 15000 });
     gen.version = (await check(binary, ['version'])).stdout.split(/\r?\n/)[0];
-    await check(binary, ['check', '-c', gen.coreFile]);
+    await checkXray(binary, gen.coreFile);
     if (options.editedNodeId && !gen.ports.has(options.editedNodeId)) {
       const edited = groups
         .flatMap((group) => group.nodes)
@@ -145,12 +213,12 @@ export async function prepare(groups, options) {
         try {
           fs.writeFileSync(
             checkFile,
-            renderSingBoxConfig([
+            renderXrayConfig([
               { enabled: true, nodes: [{ ...edited, enabled: true }] },
             ]),
             { mode: 0o600 },
           );
-          await check(binary, ['check', '-c', checkFile]);
+          await checkXray(binary, checkFile);
         } finally {
           fs.rmSync(checkFile, { force: true });
         }
@@ -172,7 +240,7 @@ export async function prepare(groups, options) {
         .splice(0)
         .map((server) => new Promise((resolve) => server.close(resolve))),
     );
-    await launch('sing-box', binary, ['run', '-c', gen.coreFile]);
+    await launch('xray', binary, ['run', '-config', gen.coreFile]);
     for (const port of gen.ports.values())
       await processReady(gen.core, { port, host: '127.0.0.1' });
     if (haproxyBinary) {

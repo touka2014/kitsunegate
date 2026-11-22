@@ -44,3 +44,6 @@ next-env.d.ts
 /runtime/bin/
 /runtime/generated/
 /runtime/.install/
+
+# Unselected design assets kept locally
+/resources/alternates/

@@ -13,6 +13,9 @@ process.env.KITSUNEGATE_SEED_DEMO_NODES = '0';
 const {
   db,
   createNode,
+  updateNode,
+  deleteNode,
+  getNode,
   getState,
   deleteGroup,
   updateGroup,
@@ -39,6 +42,7 @@ test('unusable links are rejected before insertion, including disabled links', (
 });
 
 test('split status line, explicit expected status, draft isolation, and all-down fixed routing', async () => {
+  const pendingRequest = Promise.withResolvers();
   const stub = net.createServer((socket) => {
     let step = 0;
     socket.on('error', () => {});
@@ -49,6 +53,10 @@ test('split status line, explicit expected status, draft isolation, and all-down
       }
       if (step === 2) {
         socket.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 80]));
+        return;
+      }
+      if (data.toString().startsWith('GET /pending ')) {
+        pendingRequest.resolve(socket);
         return;
       }
       const status = data.toString().includes('GET /bad')
@@ -68,6 +76,10 @@ test('split status line, explicit expected status, draft isolation, and all-down
       uri: 'socks://127.0.0.1:1080',
       adapterPort: stub.address().port,
     });
+    runtime.generation = {
+      ports: new Map([[n.id, stub.address().port]]),
+      core: { pid: 1, exitCode: null, signalCode: null },
+    };
     updateGroup('grp_us', {
       probeUrls: ['http://probe.invalid/generate_204'],
       riseThreshold: 1,
@@ -94,9 +106,70 @@ test('split status line, explicit expected status, draft isolation, and all-down
     );
     recordNodeHealth(n.id, { ok: false, error: 'down', latencyMs: null });
     assert.equal(runtime.selectNode({ id: 'grp_us' }, {}), null);
+    updateGroup('grp_us', { probeUrls: ['http://probe.invalid/pending'] });
+    const pendingReport = runtime.testGroup('grp_us');
+    const socket = await pendingRequest.promise;
+    deleteNode(n.id);
+    runtime.generation = { ports: new Map() };
+    socket.end('HTTP/1.1 204 No Content\r\n\r\n');
+    const { results } = await pendingReport;
+    assert.equal(results[0].id, n.id);
+    assert.equal(results[0].probe.statusCode, 204);
+    assert.equal(results[0].successCount, undefined);
   } finally {
+    runtime.generation = null;
     await new Promise((resolve) => stub.close(resolve));
   }
+});
+
+test('entering fixed mode defaults to the highest-priority enabled node and remembers a manual choice', () => {
+  const group = 'grp_us';
+  const switchMode = (mode) => updateGroup(group, { mode }).selectedNodeId;
+  switchMode('load_balance');
+  const link = { uri: 'socks://127.0.0.1:1080' };
+  const disabled = createNode(group, { ...link, priority: 1, enabled: false });
+  assert.equal(switchMode('fixed'), null);
+  switchMode('fallback');
+  const alternate = createNode(group, { ...link, priority: 5 });
+  const preferred = createNode(group, { ...link, priority: 2 });
+  assert.equal(switchMode('fixed'), preferred.id);
+  updateGroup(group, { selectedNodeId: alternate.id });
+  switchMode('latency_best');
+  assert.equal(switchMode('fixed'), alternate.id);
+  for (const n of [disabled, alternate, preferred]) deleteNode(n.id);
+});
+
+test('retargeting a node clears former health, selection can be cleared, and routing inputs are validated', () => {
+  const node = createNode('grp_jp', { uri: 'socks://127.0.0.1:20001' });
+  updateGroup('grp_jp', {
+    riseThreshold: 1,
+    mode: 'fixed',
+    selectedNodeId: node.id,
+  });
+  recordNodeHealth(node.id, { ok: true, statusCode: 204, latencyMs: 5 });
+  updateNode(node.id, { name: 'renamed', uri: 'socks://127.0.0.1:20001' });
+  assert.equal(getNode(node.id).healthStatus, 'healthy');
+  updateNode(node.id, { uri: 'socks://127.0.0.1:20002' });
+  assert.equal(getNode(node.id).healthStatus, 'unknown');
+  assert.equal(getNode(node.id).latencyMs, null);
+  assert.equal(
+    updateGroup('grp_jp', { selectedNodeId: null }).selectedNodeId,
+    null,
+  );
+  updateGroup('grp_jp', { selectedNodeId: node.id });
+  deleteNode(node.id);
+  assert.equal(
+    getState().groups.find((g) => g.id === 'grp_jp').selectedNodeId,
+    null,
+  );
+  assert.throws(
+    () => createNode('grp_jp', { uri: 'socks://localhost', priority: -1 }),
+    /priority/,
+  );
+  assert.throws(
+    () => createNode('grp_jp', { uri: 'socks://localhost', weight: 1.5 }),
+    /weight/,
+  );
 });
 
 test('traffic rates weight coverage, split crossing intervals and preserve missing buckets', () => {

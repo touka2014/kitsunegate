@@ -118,7 +118,12 @@ const server = http.createServer(async (request, response) => {
     return sendJson(response, 415, {
       error: 'Use application/json for management writes.',
     });
-  const url = new URL(request.url ?? '/', `http://127.0.0.1:${port}`);
+  let url;
+  try {
+    url = new URL(request.url ?? '/', 'http://127.0.0.1');
+  } catch {
+    return sendJson(response, 400, { error: 'Invalid request URL.' });
+  }
   const segments = url.pathname.split('/').filter(Boolean);
 
   try {
@@ -190,7 +195,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'GET' && url.pathname === '/api/engine/preview') {
       return sendJson(response, 200, {
         haproxy: runtime.generation?.haConfig ?? '',
-        singbox: runtime.generation?.singConfig ?? '',
+        xray: runtime.generation?.coreConfig ?? '',
       });
     }
     if (request.method === 'POST' && url.pathname === '/api/groups') {
@@ -226,9 +231,26 @@ const server = http.createServer(async (request, response) => {
         return sendJson(response, 200, result);
       }
       if (request.method === 'POST' && segments[3] === 'nodes') {
+        const {
+          sourceType,
+          uri,
+          manual,
+          json,
+          name,
+          weight,
+          priority,
+          enabled,
+        } = await readBody(request);
         const input = {
-          ...(await readBody(request)),
           id: 'node_' + crypto.randomUUID(),
+          sourceType,
+          uri,
+          manual,
+          json,
+          name,
+          weight,
+          priority,
+          enabled,
         };
         const result = await runtime.reload('Proxy node added', () =>
           createNode(groupId, input),
@@ -295,9 +317,17 @@ if (apiSocket) {
   // The directory is private to this container, shared only with nginx.
   fs.rmSync(apiSocket, { force: true });
   process.umask(0o077);
-  server.listen(apiSocket, () =>
-    console.log('KitsuneGate management socket ready.'),
-  );
+  server.listen(apiSocket, () => {
+    if (process.env.KITSUNEGATE_WEB_GID) {
+      fs.chownSync(
+        apiSocket,
+        process.getuid(),
+        Number(process.env.KITSUNEGATE_WEB_GID),
+      );
+      fs.chmodSync(apiSocket, 0o660);
+    }
+    console.log('KitsuneGate management socket ready.');
+  });
 } else
   server.listen(port, '127.0.0.1', () =>
     console.log('KitsuneGate API on loopback port ' + port),

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { renderHAProxyConfig, renderSingBoxConfig } from './engine.mjs';
+import { renderHAProxyConfig, renderXrayConfig } from './engine.mjs';
 
 const baseGroup = {
   id: 'test-pool',
@@ -57,12 +57,17 @@ test('fixed mode never exposes another node at startup', () => {
   );
 });
 
-test('sing-box exposes one local adapter inbound per enabled node', () => {
-  const config = JSON.parse(renderSingBoxConfig([baseGroup]));
+test('Xray exposes one local adapter inbound per enabled node', () => {
+  const config = JSON.parse(renderXrayConfig([baseGroup]));
   assert.equal(config.inbounds.length, 2);
+  assert.equal(config.outbounds[0].protocol, 'blackhole');
   assert.deepEqual(
-    config.inbounds.map((item) => item.listen_port),
+    config.inbounds.map((i) => i.listen),
+    ['127.0.0.1', '127.0.0.1'],
+  );
+  assert.deepEqual(
+    config.inbounds.map((item) => item.port),
     [12001, 12002],
   );
-  assert.equal(config.route.rules[1].outbound, 'out-node-b');
+  assert.equal(config.routing.rules[1].outboundTag, 'out-node-b');
 });

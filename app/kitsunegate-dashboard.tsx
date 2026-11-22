@@ -182,7 +182,7 @@ type AppState = {
     status: string;
     mode: string;
     haproxy: boolean;
-    singbox: boolean;
+    xray: boolean;
     balancer: string | null;
     version: string | null;
     haproxyVersion?: string | null;
@@ -223,11 +223,14 @@ type ManualNodeConfig = {
   method: string;
   encryption: string;
   flow: string;
-  network: 'tcp' | 'ws' | 'grpc' | 'httpupgrade';
+  network: 'tcp' | 'ws' | 'grpc' | 'httpupgrade' | 'xhttp';
   security: 'none' | 'tls' | 'reality';
   sni: string;
   fingerprint: string;
-  allowInsecure: boolean;
+  pinnedPeerCertSha256: string;
+  xhttpMode: string;
+  xhttpExtra: string;
+  spiderX: string;
   realityPublicKey: string;
   realityShortId: string;
   path: string;
@@ -288,14 +291,21 @@ const emptyNode: NodeDraft = {
   priority: 1,
   enabled: true,
   uri: '',
-  json: `{
-  "type": "vless",
-  "tag": "custom-out",
-  "server": "proxy.example.com",
-  "server_port": 443,
-  "uuid": "",
-  "tls": { "enabled": true, "server_name": "proxy.example.com" }
-}`,
+  json: JSON.stringify(
+    {
+      tag: 'custom-out',
+      protocol: 'vless',
+      settings: {
+        address: 'proxy.example.com',
+        port: 443,
+        id: '',
+        encryption: 'none',
+      },
+      streamSettings: { network: 'tcp', security: 'tls' },
+    },
+    null,
+    2,
+  ),
   manual: {
     protocol: 'vless',
     server: '',
@@ -310,7 +320,10 @@ const emptyNode: NodeDraft = {
     security: 'tls',
     sni: '',
     fingerprint: 'chrome',
-    allowInsecure: false,
+    pinnedPeerCertSha256: '',
+    xhttpMode: 'auto',
+    xhttpExtra: '',
+    spiderX: '/',
     realityPublicKey: '',
     realityShortId: '',
     path: '/',
@@ -335,7 +348,8 @@ const navItems: { id: View; label: string; icon: typeof LayoutDashboard }[] = [
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set('Content-Type', 'application/json');
-  const response = await fetch(`${API_BASE}${path}`, {
+  const url = new URL(`${API_BASE}${path}`, window.location.origin);
+  const response = await fetch(url, {
     ...init,
     headers,
   });
@@ -372,7 +386,8 @@ function nodePayload(draft: NodeDraft) {
     priority: draft.priority,
     enabled: draft.enabled,
   };
-  if (draft.sourceType === 'manual') return { ...common, manual: draft.manual };
+  if (draft.sourceType === 'manual')
+    return { ...common, manual: { ...draft.manual, allowInsecure: false } };
   if (draft.sourceType === 'json') return { ...common, json: draft.json };
   return { ...common, uri: draft.uri };
 }
@@ -475,7 +490,7 @@ export default function KitsuneGateDashboard() {
   const [checkError, setCheckError] = useState<string | null>(null);
   const [configPreview, setConfigPreview] = useState<{
     haproxy: string;
-    singbox: string;
+    xray: string;
   } | null>(null);
 
   useDocumentLocale(state?.settings.uiLanguage ?? 'en', Boolean(state));
@@ -515,10 +530,22 @@ export default function KitsuneGateDashboard() {
 
   const selectedGroup =
     state?.groups.find((group) => group.id === detailId) ?? null;
+  const rememberedNodeId =
+    selectedGroup?.nodes.find((node) => node.id === groupDraft?.selectedNodeId)
+      ?.id ?? null;
+  // The API lists nodes in priority order, lowest number first.
+  const fixedNodeId =
+    groupDraft?.mode === 'fixed'
+      ? (rememberedNodeId ??
+        selectedGroup?.nodes.find((node) => node.enabled)?.id ??
+        null)
+      : null;
   const probeDraftChanged = Boolean(
     groupDraft &&
     selectedGroup &&
     (groupDraft.probeTimeout !== selectedGroup.probeTimeout ||
+      groupDraft.probeInterval !== selectedGroup.probeInterval ||
+      groupDraft.latencyTolerance !== selectedGroup.latencyTolerance ||
       groupDraft.riseThreshold !== selectedGroup.riseThreshold ||
       groupDraft.fallThreshold !== selectedGroup.fallThreshold ||
       JSON.stringify(groupDraft.probeUrls) !==
@@ -593,13 +620,19 @@ export default function KitsuneGateDashboard() {
 
   async function saveGroup() {
     if (!selectedGroup || !groupDraft) return;
+    const updatedDraft = {
+      ...groupDraft,
+      selectedNodeId:
+        groupDraft.mode === 'fixed' ? fixedNodeId : rememberedNodeId,
+    };
     const ok = await mutate(
       'save-group',
       `/groups/${selectedGroup.id}`,
-      { method: 'PUT', body: JSON.stringify(groupDraft) },
+      { method: 'PUT', body: JSON.stringify(updatedDraft) },
       '代理组设置已保存',
     );
-    if (ok) setGroupDraft((draft) => (draft ? { ...draft } : draft));
+    if (ok)
+      setGroupDraft((draft) => (draft === groupDraft ? updatedDraft : draft));
   }
 
   async function deleteGroup(group: ProxyGroup) {
@@ -825,7 +858,7 @@ export default function KitsuneGateDashboard() {
             </div>
             <p className="mt-2 text-xs leading-5 text-slate-400">
               {state?.engine.status === 'running'
-                ? `sing-box 已接管流量；${state.engine.balancer === 'builtin' ? '内置均衡器' : 'HAProxy'}负责端口分流。`
+                ? `Xray 已接管流量；${state.engine.balancer === 'builtin' ? '内置均衡器' : 'HAProxy'}负责端口分流。`
                 : state?.engine.lastError || '请检查运行日志。'}
             </p>
           </div>
@@ -1050,11 +1083,8 @@ export default function KitsuneGateDashboard() {
                         key={node.id}
                         node={node}
                         language={language}
-                        selectable={
-                          groupDraft.mode === 'fixed' ||
-                          groupDraft.mode === 'latency_best'
-                        }
-                        selected={groupDraft.selectedNodeId === node.id}
+                        selectable={groupDraft.mode === 'fixed' && node.enabled}
+                        selected={fixedNodeId === node.id}
                         busy={busy}
                         onSelect={() =>
                           setGroupDraft({
@@ -1095,8 +1125,7 @@ export default function KitsuneGateDashboard() {
                         detail="可用基础表单、出站 JSON 或分享链接添加代理节点。"
                       />
                     )}
-                    {(groupDraft.mode === 'fixed' ||
-                      groupDraft.mode === 'latency_best') && (
+                    {groupDraft.mode === 'fixed' && (
                       <Button
                         className="w-full"
                         variant="outline"
@@ -1217,7 +1246,7 @@ export default function KitsuneGateDashboard() {
               <DialogTitle>{checkTitle}</DialogTitle>
               <DialogDescription>
                 {
-                  '请求会通过每个节点自己的 sing-box SOCKS 适配端口访问检测地址，不再使用模拟结果。'
+                  '请求会通过每个节点自己的 Xray SOCKS 适配端口访问检测地址，不再使用模拟结果。'
                 }
               </DialogDescription>
             </DialogHeader>
@@ -1253,7 +1282,7 @@ function NodeEditor({
   const manual = draft.manual;
   const updateManual = (values: Partial<ManualNodeConfig>) =>
     onChange({ ...draft, manual: { ...manual, ...values } });
-  const hasTransport = ['vless', 'vmess', 'trojan'].includes(manual.protocol);
+  const hasTransport = manual.protocol !== 'hysteria2';
   const hasTls = hasTransport || manual.protocol === 'hysteria2';
 
   return (
@@ -1332,8 +1361,11 @@ function NodeEditor({
                 onChange={(value) =>
                   updateManual({
                     protocol: value as ManualNodeConfig['protocol'],
-                    serverPort: value === 'ss' ? 8388 : 443,
-                    security: value === 'hysteria2' ? 'tls' : manual.security,
+                    serverPort:
+                      value === 'ss' ? 8388 : value === 'socks' ? 1080 : 443,
+                    network: 'tcp',
+                    encryption: value === 'vmess' ? 'auto' : 'none',
+                    security: ['ss', 'socks'].includes(value) ? 'none' : 'tls',
                   })
                 }
               >
@@ -1395,8 +1427,7 @@ function NodeEditor({
                     onChange={(value) => updateManual({ encryption: value })}
                   >
                     <option value="auto">auto</option>
-                    <option value="none">none</option>
-                    <option value="zero">zero</option>
+
                     <option value="aes-128-gcm">aes-128-gcm</option>
                     <option value="chacha20-poly1305">chacha20-poly1305</option>
                   </SelectField>
@@ -1490,6 +1521,7 @@ function NodeEditor({
                     <option value="ws">WebSocket</option>
                     <option value="grpc">gRPC</option>
                     <option value="httpupgrade">HTTPUpgrade</option>
+                    <option value="xhttp">XHTTP</option>
                   </SelectField>
                 </Field>
                 <Field label="安全">
@@ -1507,7 +1539,7 @@ function NodeEditor({
                   </SelectField>
                 </Field>
               </div>
-              {['ws', 'httpupgrade'].includes(manual.network) && (
+              {['ws', 'httpupgrade', 'xhttp'].includes(manual.network) && (
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
                   <Field label="路径">
                     <Input
@@ -1523,6 +1555,35 @@ function NodeEditor({
                       value={manual.host}
                       onChange={(event) =>
                         updateManual({ host: event.target.value })
+                      }
+                    />
+                  </Field>
+                </div>
+              )}
+              {manual.network === 'xhttp' && (
+                <div className="mt-4 space-y-3">
+                  <Field label="XHTTP 模式">
+                    <SelectField
+                      value={manual.xhttpMode}
+                      onChange={(xhttpMode) => updateManual({ xhttpMode })}
+                    >
+                      {['auto', 'packet-up', 'stream-up', 'stream-one'].map(
+                        (mode) => (
+                          <option key={mode} value={mode}>
+                            {mode}
+                          </option>
+                        ),
+                      )}
+                    </SelectField>
+                  </Field>
+                  <Field label="XHTTP 扩展参数（JSON）">
+                    <textarea
+                      className="min-h-20 w-full rounded-lg border bg-white p-2 font-mono text-xs"
+                      spellCheck={false}
+                      placeholder='{"xPaddingBytes":"100-1000"}'
+                      value={manual.xhttpExtra}
+                      onChange={(event) =>
+                        updateManual({ xhttpExtra: event.target.value })
                       }
                     />
                   </Field>
@@ -1559,34 +1620,33 @@ function NodeEditor({
                       placeholder="默认使用服务器地址"
                     />
                   </Field>
-                  <Field label="浏览器指纹">
-                    <SelectField
-                      value={manual.fingerprint}
-                      onChange={(value) => updateManual({ fingerprint: value })}
-                    >
-                      <option value="chrome">Chrome</option>
-                      <option value="firefox">Firefox</option>
-                      <option value="safari">Safari</option>
-                      <option value="edge">Edge</option>
-                      <option value="">不启用 uTLS</option>
-                    </SelectField>
+                  {manual.protocol !== 'hysteria2' && (
+                    <Field label="浏览器指纹">
+                      <SelectField
+                        value={manual.fingerprint}
+                        onChange={(value) =>
+                          updateManual({ fingerprint: value })
+                        }
+                      >
+                        <option value="chrome">Chrome</option>
+                        <option value="firefox">Firefox</option>
+                        <option value="safari">Safari</option>
+                        <option value="edge">Edge</option>
+                        <option value="">Xray default</option>
+                      </SelectField>
+                    </Field>
+                  )}
+                </div>
+                {manual.security === 'tls' && (
+                  <Field label="证书 SHA-256 指纹（可选）">
+                    <Input
+                      value={manual.pinnedPeerCertSha256}
+                      onChange={(e) =>
+                        updateManual({ pinnedPeerCertSha256: e.target.value })
+                      }
+                    />
                   </Field>
-                </div>
-                <div className="mt-4 flex items-center justify-between rounded-lg border bg-white px-3 py-2 text-sm">
-                  <span>
-                    <span className="block font-medium">允许不安全证书</span>
-                    <span className="text-xs text-muted-foreground">
-                      仅在确认服务端证书情况时启用
-                    </span>
-                  </span>
-                  <Switch
-                    aria-label="允许不安全证书"
-                    checked={manual.allowInsecure}
-                    onCheckedChange={(checked) =>
-                      updateManual({ allowInsecure: checked })
-                    }
-                  />
-                </div>
+                )}
                 {manual.security === 'reality' && (
                   <div className="mt-4 grid gap-4 sm:grid-cols-2">
                     <Field label="Reality 公钥">
@@ -1595,6 +1655,15 @@ function NodeEditor({
                         onChange={(event) =>
                           updateManual({ realityPublicKey: event.target.value })
                         }
+                      />
+                    </Field>
+                    <Field label="SpiderX">
+                      <Input
+                        value={manual.spiderX}
+                        onChange={(e) =>
+                          updateManual({ spiderX: e.target.value })
+                        }
+                        placeholder="/"
                       />
                     </Field>
                     <Field label="Short ID">
@@ -1652,9 +1721,8 @@ function NodeEditor({
         </TabsContent>
         <TabsContent value="json" className="mt-4 space-y-3">
           <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs leading-5 text-blue-800">
-            可粘贴单个 sing-box 出站、完整含 outbounds 的 sing-box 配置，或
-            3x-ui/Xray 风格的 <code>protocol / settings / streamSettings</code>{' '}
-            出站对象。
+            导入一个 Xray 或 3x-ui 出站。旧版 sing-box JSON
+            会在保存时检查兼容性。
           </div>
           <Field label="出站 JSON">
             <textarea
@@ -1790,11 +1858,14 @@ function OverviewDashboard({
   }, [range, state.settings.metricsSampleIntervalSeconds]);
 
   const chartData = (trend?.points ?? []).map((point) => ({
-    time: new Date(point.createdAt).toLocaleTimeString('zh-CN', {
-      hour: '2-digit',
-      minute: '2-digit',
-      ...(range === '30m' || range === '1h' ? { second: '2-digit' } : {}),
-    }),
+    time: new Date(point.createdAt).toLocaleTimeString(
+      state.settings.uiLanguage,
+      {
+        hour: '2-digit',
+        minute: '2-digit',
+        ...(range === '30m' || range === '1h' ? { second: '2-digit' } : {}),
+      },
+    ),
     down:
       point.bytesOutPerSecond === null
         ? null
@@ -1832,11 +1903,11 @@ function OverviewDashboard({
             </div>
             <h2 className="mt-3 text-2xl font-semibold">
               {state.engine.status === 'running'
-                ? `${enabledGroups} 个监听端口正在接管流量`
+                ? `${enabledGroups} 个监听端口已启用`
                 : state.engine.lastError || '真实引擎尚未启动'}
             </h2>
             <p className="mt-2 text-sm text-slate-300">
-              {state.engine.version || 'sing-box 未就绪'} ·{' '}
+              {state.engine.version || 'Xray 未就绪'} ·{' '}
               {state.engine.balancer === 'builtin'
                 ? 'KitsuneGate 内置均衡器'
                 : 'HAProxy'}{' '}
@@ -1881,7 +1952,7 @@ function OverviewDashboard({
         <Metric
           icon={Gauge}
           label="平均延迟"
-          value={`${avgLatency || 0} ms`}
+          value={healthyNodes ? `${avgLatency} ms` : '—'}
           detail="真实 HTTP 探测"
           tone="violet"
         />
@@ -2145,12 +2216,20 @@ function ProbeResultPanel({
         <p className="mt-2 text-sm text-rose-700">{error}</p>
       </div>
     );
+  if (!results.length)
+    return (
+      <Empty
+        icon={WifiOff}
+        title="没有可检测节点"
+        detail="请先启用至少一个真实代理节点。"
+      />
+    );
   return (
     <div className="space-y-4">
       <div
         className={cn(
           'rounded-2xl p-5 text-white',
-          results.length && passed === results.length
+          passed === results.length
             ? 'bg-emerald-600'
             : passed
               ? 'bg-amber-500'
@@ -2183,6 +2262,9 @@ function ProbeResultPanel({
               </span>
             </div>
             <div className="space-y-2">
+              {!report.results.length && (
+                <p className="text-xs text-muted-foreground">没有可检测节点</p>
+              )}
               {report.results.map((result) => (
                 <div
                   key={result.id}
@@ -2208,7 +2290,7 @@ function ProbeResultPanel({
                         result.probe.ok ? 'text-emerald-700' : 'text-rose-700',
                       )}
                     >
-                      {result.probe.latencyMs
+                      {result.probe.latencyMs !== null
                         ? `${Math.round(result.probe.latencyMs)} ms`
                         : '失败'}
                     </span>
@@ -2232,13 +2314,6 @@ function ProbeResultPanel({
             </div>
           </section>
         ))}
-        {!results.length && (
-          <Empty
-            icon={WifiOff}
-            title="没有可检测节点"
-            detail="请先启用至少一个真实代理节点。"
-          />
-        )}
       </div>
     </div>
   );
@@ -2493,7 +2568,7 @@ function HealthForm({
       </div>
       <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs leading-5 text-emerald-800">
         {
-          '检测会经节点独立的 sing-box SOCKS 适配端口发起真实 HTTP/HTTPS 请求。失败与恢复阈值用于抑制偶发网络抖动。'
+          '检测会经节点独立的 Xray SOCKS 适配端口发起真实 HTTP/HTTPS 请求。失败与恢复阈值用于抑制偶发网络抖动。'
         }
       </div>
     </>
@@ -2580,7 +2655,9 @@ function NodeRow({
       <div className="flex items-start justify-between gap-3">
         <button
           className="min-w-0 flex-1 text-left"
-          onClick={selectable ? onSelect : undefined}
+          disabled={!selectable}
+          aria-pressed={selectable ? selected : undefined}
+          onClick={onSelect}
         >
           <div className="flex flex-wrap items-center gap-2">
             <StatusDot status={node.healthStatus} />
@@ -2962,7 +3039,8 @@ function EventList({
             <div className="mt-4 grid gap-2 sm:grid-cols-[160px_160px_1fr]">
               <SelectField value={source} onChange={setSource} tone="dark">
                 <option value="all">全部来源</option>
-                <option value="sing-box">代理核心 · sing-box</option>
+                <option value="xray">代理核心 · Xray</option>
+                <option value="sing-box">sing-box (legacy)</option>
                 <option value="haproxy">HAProxy</option>
                 <option value="api">管理 API</option>
                 <option value="engine">运行管理器</option>
@@ -3191,7 +3269,7 @@ function SettingsPanel({
               </SelectField>
             </Field>
             <p className="-mt-3 text-xs leading-5 text-muted-foreground">
-              该等级同时应用到 sing-box 输出和 KitsuneGate 日志入库过滤。
+              该等级同时应用到 Xray 输出和 KitsuneGate 日志入库过滤。
             </p>
             <NumberField
               label="日志保留天数"
@@ -3260,12 +3338,12 @@ function ConfigPreview({
   loading,
   onReload,
 }: {
-  preview: { haproxy: string; singbox: string } | null;
+  preview: { haproxy: string; xray: string } | null;
   loading: boolean;
   onReload: () => void;
 }) {
-  const [kind, setKind] = useState<'haproxy' | 'singbox'>('haproxy');
-  const activeKind = preview?.haproxy ? kind : 'singbox';
+  const [kind, setKind] = useState<'haproxy' | 'xray'>('haproxy');
+  const activeKind = preview?.haproxy ? kind : 'xray';
   const content = preview?.[activeKind] ?? '';
   async function copy() {
     await navigator.clipboard.writeText(content);
@@ -3293,13 +3371,13 @@ function ConfigPreview({
             HAProxy
           </button>
           <button
-            onClick={() => setKind('singbox')}
+            onClick={() => setKind('xray')}
             className={cn(
               'rounded-md px-3 py-1.5 text-xs',
-              activeKind === 'singbox' && 'bg-white font-medium shadow-sm',
+              activeKind === 'xray' && 'bg-white font-medium shadow-sm',
             )}
           >
-            sing-box
+            Xray
           </button>
         </div>
         <div className="flex gap-1">

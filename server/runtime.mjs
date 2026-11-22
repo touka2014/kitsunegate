@@ -1,9 +1,14 @@
 import fs from 'node:fs';
 import net from 'node:net';
-import { probeTarget } from './probes.mjs';
-import { alive, discard, listen, prepare } from './generation.mjs';
+import { probeThroughNode } from './probes.mjs';
+import {
+  alive,
+  discard,
+  inspectUpgrade,
+  listen,
+  prepare,
+} from './generation.mjs';
 import path from 'node:path';
-import tls from 'node:tls';
 
 import {
   db,
@@ -14,7 +19,10 @@ import {
   getSettings,
   getNode,
   getRawStateForEngine,
+  getRoutingGroups,
   recordNodeHealth,
+  needsXrayMigration,
+  finishXrayMigration,
 } from './database.mjs';
 
 import {
@@ -28,8 +36,7 @@ const runtimeDirectory = path.resolve(
     'runtime',
 );
 const generatedDirectory = path.join(runtimeDirectory, 'generated');
-const executableName =
-  process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+const executableName = process.platform === 'win32' ? 'xray.exe' : 'xray';
 const bundledExecutable = path.join(runtimeDirectory, 'bin', executableName);
 
 const haproxySocketPath =
@@ -41,7 +48,7 @@ const haproxySocketPath =
 fs.mkdirSync(generatedDirectory, { recursive: true });
 
 function executablePath() {
-  if (process.env.SING_BOX_BIN) return path.resolve(process.env.SING_BOX_BIN);
+  if (process.env.XRAY_BIN) return path.resolve(process.env.XRAY_BIN);
   if (fs.existsSync(bundledExecutable)) return bundledExecutable;
   return null;
 }
@@ -75,214 +82,12 @@ function freshMetrics(initial = {}) {
 }
 
 function logLevel(line) {
+  const severity = /\[(debug|info|warning|error)\]/i.exec(line);
+  if (severity) return severity[1].toLowerCase();
   if (/fatal|error/i.test(line)) return 'error';
   if (/warn/i.test(line)) return 'warning';
   if (/debug|trace/i.test(line)) return 'debug';
   return 'info';
-}
-
-function waitForData(socket, minimum, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let buffer = Buffer.alloc(0);
-    const timeout = setTimeout(
-      () => finish(new Error('SOCKS handshake timed out')),
-      timeoutMs,
-    );
-    function cleanup() {
-      clearTimeout(timeout);
-      socket.off('data', onData);
-      socket.off('error', finish);
-      socket.off('close', onClose);
-    }
-    function finish(error, value) {
-      cleanup();
-      if (error) reject(error);
-      else resolve(value);
-    }
-    function onClose() {
-      finish(new Error('SOCKS connection closed early'));
-    }
-    function onData(chunk) {
-      buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.length >= minimum) finish(null, buffer);
-    }
-    socket.on('data', onData);
-    socket.once('error', finish);
-    socket.once('close', onClose);
-  });
-}
-
-function waitForSocksReply(socket, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let buffer = Buffer.alloc(0);
-    const timeout = setTimeout(
-      () => finish(new Error('SOCKS connection response timed out')),
-      timeoutMs,
-    );
-    function cleanup() {
-      clearTimeout(timeout);
-      socket.off('data', onData);
-      socket.off('error', finish);
-      socket.off('close', onClose);
-    }
-    function finish(error, value) {
-      cleanup();
-      if (error) reject(error);
-      else resolve(value);
-    }
-    function onClose() {
-      finish(new Error('SOCKS connection closed early'));
-    }
-    function onData(chunk) {
-      buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.length < 5) return;
-      const required =
-        buffer[3] === 0x01
-          ? 10
-          : buffer[3] === 0x04
-            ? 22
-            : buffer[3] === 0x03
-              ? 7 + buffer[4]
-              : 5;
-      if (buffer.length >= required) {
-        if (buffer.length > required) socket.unshift(buffer.subarray(required));
-        finish(null, buffer.subarray(0, required));
-      }
-    }
-    socket.on('data', onData);
-    socket.once('error', finish);
-    socket.once('close', onClose);
-  });
-}
-
-async function openSocksTunnel(adapterPort, host, port, timeoutMs) {
-  const socket = net.createConnection({ host: '127.0.0.1', port: adapterPort });
-  try {
-    socket.setTimeout(timeoutMs, () =>
-      socket.destroy(new Error('Connecting to the proxy adapter timed out')),
-    );
-    await new Promise((resolve, reject) => {
-      socket.once('connect', resolve);
-      socket.once('error', reject);
-    });
-    socket.write(Buffer.from([0x05, 0x01, 0x00]));
-    const greeting = await waitForData(socket, 2, timeoutMs);
-    if (greeting[0] !== 0x05 || greeting[1] !== 0x00)
-      throw new Error('SOCKS5 authentication negotiation failed');
-
-    const hostBuffer = Buffer.from(host);
-    if (hostBuffer.length > 255) throw new Error('Probe hostname is too long');
-    socket.write(
-      Buffer.concat([
-        Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuffer.length]),
-        hostBuffer,
-        Buffer.from([(port >> 8) & 0xff, port & 0xff]),
-      ]),
-    );
-    const response = await waitForSocksReply(socket, timeoutMs);
-    if (response[1] !== 0x00)
-      throw new Error(
-        `SOCKS5 target connection failed with code ${response[1]}`,
-      );
-    socket.setTimeout(0);
-    return socket;
-  } catch (error) {
-    socket.destroy();
-    throw error;
-  }
-}
-
-async function probeThroughNode(node, probeUrl, timeoutSeconds) {
-  const started = performance.now();
-  let socket;
-  let stream;
-  try {
-    const { url: target, expected } = probeTarget(probeUrl);
-    probeUrl = target.href;
-    const targetPort = Number(
-      target.port || (target.protocol === 'https:' ? 443 : 80),
-    );
-    socket = await openSocksTunnel(
-      node.adapter_port,
-      target.hostname,
-      targetPort,
-      timeoutSeconds * 1000,
-    );
-    stream =
-      target.protocol === 'https:'
-        ? tls.connect({
-            socket,
-            servername: target.hostname,
-            rejectUnauthorized: true,
-          })
-        : socket;
-    if (target.protocol === 'https:') {
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(
-          () => reject(new Error('TLS handshake timed out')),
-          timeoutSeconds * 1000,
-        );
-        stream.once('secureConnect', () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-        stream.once('error', (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-      });
-    }
-    const response = new Promise((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error('HTTP probe timed out')),
-        timeoutSeconds * 1000,
-      );
-      let line = '';
-      stream.on('data', function readLine(chunk) {
-        line += chunk.toString('latin1', 0, Math.min(chunk.length, 8193));
-        const end = line.indexOf('\r\n');
-        if (end < 0 && line.length <= 8192) return;
-        stream.off('data', readLine);
-        clearTimeout(timeout);
-        const match =
-          end >= 0 &&
-          end <= 8192 &&
-          /^HTTP\/\d(?:\.\d)?\s+(\d{3})(?:\s|$)/.exec(line.slice(0, end));
-        if (!match) reject(new Error('Invalid HTTP status line'));
-        else resolve(Number(match[1]));
-      });
-      stream.once('error', (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      });
-    });
-    stream.write(
-      `GET ${target.pathname}${target.search} HTTP/1.1\r\nHost: ${target.host}\r\nUser-Agent: KitsuneGate/0.1\r\nConnection: close\r\n\r\n`,
-    );
-    const statusCode = await response;
-    const ok =
-      expected === null
-        ? statusCode >= 200 && statusCode < 300
-        : statusCode === expected;
-    return {
-      ok,
-      statusCode,
-      latencyMs: performance.now() - started,
-      url: probeUrl,
-      error: ok ? null : `HTTP ${statusCode}; expected ${expected ?? '2xx'}`,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      statusCode: null,
-      latencyMs: null,
-      url: probeUrl,
-      error: error instanceof Error ? error.message : 'Unknown probe error',
-    };
-  } finally {
-    stream?.destroy();
-    socket?.destroy();
-  }
 }
 
 class RelayRuntime {
@@ -304,6 +109,7 @@ class RelayRuntime {
     this.lastProbeAt = new Map();
     this.selectedByGroup = new Map();
     this.groupTests = new Map();
+    this.nodeTests = new Map();
     this.haproxyVersion = null;
     this.useHAProxy = false;
     this.lastMetricsErrorAt = 0;
@@ -321,6 +127,14 @@ class RelayRuntime {
 
   async start() {
     try {
+      if (needsXrayMigration()) {
+        const rejected = await inspectUpgrade(
+          getRawStateForEngine(),
+          executablePath(),
+          generatedDirectory,
+        );
+        finishXrayMigration(rejected);
+      }
       await this.reload('Application startup');
     } catch (error) {
       this.status = 'error';
@@ -391,8 +205,8 @@ class RelayRuntime {
     this.status = 'stopped';
   }
 
-  groups() {
-    const groups = getRawStateForEngine();
+  groups(groupId) {
+    const groups = getRoutingGroups(groupId);
     for (const group of groups)
       for (const node of group.nodes) {
         node.adapter_port =
@@ -472,11 +286,12 @@ class RelayRuntime {
     };
     if (!requiresReload(previousSettings, settings)) return commit();
     const previous = this.generation;
+    const balancer =
+      process.env.KITSUNEGATE_BALANCER ?? process.env.RELAYDECK_BALANCER;
     const haproxyBinary =
-      (process.env.KITSUNEGATE_BALANCER ?? process.env.RELAYDECK_BALANCER) ===
-      'builtin'
-        ? null
-        : haproxyExecutablePath();
+      balancer === 'builtin' ? null : haproxyExecutablePath();
+    if (balancer === 'haproxy' && !haproxyBinary)
+      throw new Error('Required HAProxy binary is missing.');
     const gen = await prepare(groups, {
       directory: generatedDirectory,
       socketPath: haproxySocketPath,
@@ -527,6 +342,8 @@ class RelayRuntime {
       this.servers.set(key, entry);
     }
     this.generation = gen;
+    this.groupTests.clear();
+    this.nodeTests.clear();
     this.coreProcess = gen.core;
     this.haproxyProcess = gen.haproxy;
     this.useHAProxy = !!haproxyBinary;
@@ -547,7 +364,6 @@ class RelayRuntime {
     this.startedAt = new Date().toISOString();
     if (previous) await this.retire(previous);
     this.writeLog('engine', 'info', reason + ' applied.');
-    this.groupTests.clear();
     void this.testAll().catch((error) =>
       this.writeLog('engine', 'warning', error.message),
     );
@@ -653,7 +469,7 @@ class RelayRuntime {
 
   async syncHAProxyGroup(groupId) {
     if (!this.useHAProxy || this.status !== 'running') return;
-    const group = this.groups().find((item) => item.id === groupId);
+    const group = this.groups(groupId)[0];
     if (!group?.enabled) return;
     const enabled = group.nodes.filter(
       (node) =>
@@ -788,7 +604,7 @@ class RelayRuntime {
   }
 
   selectNode(group, metrics) {
-    group = this.groups().find((item) => item.id === group.id) ?? group;
+    group = this.groups(group.id)[0] ?? group;
     const enabled = group.nodes.filter((node) => node.enabled);
     const candidates = enabled.filter(
       (node) => node.health_status !== 'unhealthy',
@@ -828,10 +644,14 @@ class RelayRuntime {
       );
     }
     if (group.algorithm === 'roundrobin') {
-      const weighted = candidates.flatMap((node) =>
-        Array(Math.max(1, Math.min(32, node.weight))).fill(node),
-      );
-      return weighted[metrics.roundRobin++ % weighted.length];
+      const total = candidates.reduce((sum, n) => sum + n.weight, 0);
+      const slot = metrics.roundRobin % total;
+      metrics.roundRobin = (slot + 1) % total;
+      let end = 0;
+      return candidates.find((n) => {
+        end += n.weight;
+        return slot < end;
+      });
     }
     return [...candidates].sort(
       (a, b) =>
@@ -840,41 +660,61 @@ class RelayRuntime {
     )[0];
   }
 
-  async testNode(id, syncHAProxy = true, draft) {
+  async testNode(id, syncHAProxy = true, draft, knownGroup) {
+    const group = knownGroup ?? this.groups(getNode(id).groupId)[0];
+    if (draft) return this.probeNode(group, id, draft);
+    let pending = this.nodeTests.get(id);
+    if (!pending) {
+      pending = this.probeNode(group, id).finally(() => {
+        if (this.nodeTests.get(id) === pending) this.nodeTests.delete(id);
+      });
+      this.nodeTests.set(id, pending);
+    }
+    const result = await pending;
+    if (syncHAProxy) await this.syncHAProxyGroup(group.id);
+    return result;
+  }
+
+  async probeNode(group, id, draft) {
     const generation = this.generation;
-    const rawGroups = this.groups();
-    const group = rawGroups.find((item) =>
-      item.nodes.some((node) => node.id === id),
-    );
     const node = group?.nodes.find((item) => item.id === id);
     if (!group || !node) throw new Error('Node not found.');
-    if (!node.enabled)
+    // A save can replace or delete this node while its probe is in flight.
+    const checkedNode = getNode(id);
+    const options = draft ?? group;
+    if (
+      !group.enabled ||
+      !node.enabled ||
+      !generation?.ports.has(id) ||
+      !alive(generation.core)
+    )
       return {
-        ...getNode(id),
+        ...checkedNode,
         probe: {
           ok: false,
           statusCode: null,
           latencyMs: null,
-          url: group.probe_urls[0],
-          error: 'Node is disabled',
+          url: options.probe_urls[0],
+          error:
+            !group.enabled || !node.enabled
+              ? 'Group or node is disabled'
+              : 'Xray adapter is unavailable',
         },
       };
     let probe;
     const attempts = [];
-    for (const probeUrl of (draft ?? group).probe_urls) {
+    for (const probeUrl of options.probe_urls) {
       probe = await probeThroughNode(
         node,
         probeUrl,
-        (draft ?? group).probe_timeout,
+        options.probe_timeout,
       );
       attempts.push(probe);
       if (probe.ok) break;
     }
     if (generation !== this.generation || draft)
-      return { ...getNode(id), probe: { ...probe, attempts } };
-    const recorded = recordNodeHealth(id, { ...probe, attempts });
-    if (syncHAProxy) await this.syncHAProxyGroup(group.id);
-    return recorded;
+      return { ...checkedNode, probe: { ...probe, attempts } };
+    return recordNodeHealth(id, { ...probe, attempts });
   }
 
   async testGroup(id, draft) {
@@ -888,13 +728,13 @@ class RelayRuntime {
   }
 
   async performGroupTest(id, draft) {
-    const group = this.groups().find((item) => item.id === id);
+    const group = this.groups(id)[0];
     if (!group) throw new Error('Proxy group not found.');
     const started = Date.now();
     const results = await Promise.all(
       group.nodes
         .filter((node) => node.enabled)
-        .map((node) => this.testNode(node.id, false, draft)),
+        .map((node) => this.testNode(node.id, false, draft, group)),
     );
     if (!draft) await this.syncHAProxyGroup(id);
     return {
@@ -907,14 +747,14 @@ class RelayRuntime {
   }
 
   async testAll() {
-    const groups = getRawStateForEngine().filter((group) => group.enabled);
+    const groups = getRoutingGroups().filter((group) => group.enabled);
     return Promise.all(groups.map((group) => this.testGroup(group.id)));
   }
 
   async runScheduledHealthChecks() {
     if (this.status !== 'running') return;
     const now = Date.now();
-    for (const group of getRawStateForEngine().filter((item) => item.enabled)) {
+    for (const group of getRoutingGroups().filter((item) => item.enabled)) {
       const last = this.lastProbeAt.get(group.id) ?? 0;
       if (now - last >= group.probe_interval * 1000) {
         this.lastProbeAt.set(group.id, now);
@@ -980,7 +820,7 @@ class RelayRuntime {
     return {
       status: this.status,
       mode: this.status === 'running' ? 'real' : 'unavailable',
-      singbox: this.status === 'running',
+      xray: this.status === 'running',
       haproxy: this.status === 'running' && this.useHAProxy,
       balancer:
         this.status === 'running'

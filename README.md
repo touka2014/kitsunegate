@@ -4,163 +4,87 @@
 
 <h1 align="center">KitsuneGate</h1>
 
-<p align="center">
-  <strong>An HAProxy-powered control plane for resilient proxy pools, automatic failover, and multi-ingress routing.</strong>
-</p>
+KitsuneGate manages independent SOCKS5 proxy groups from a web dashboard. Each group has its own listener, outbound nodes and routing policy. If a configuration change fails in one group, an active download through another can finish on the same connection.
 
-KitsuneGate turns VLESS, VMess, Shadowsocks, Trojan, Hysteria2, and SOCKS outbounds into reliable local or server-side proxy pools. Each pool owns a listener port, a routing policy, independent health checks, and live traffic telemetry. HAProxy distributes production traffic on Linux and Docker while sing-box provides the outbound protocol stack.
+![English dashboard with three fictional proxy groups, their listener ports, routing policies and node health](docs/screenshots/proxy-groups.png)
 
-> KitsuneGate is an independent project and is not affiliated with or endorsed by HAProxy Technologies or the sing-box project.
+## How it works
 
-## Highlights
+On Linux, HAProxy accepts incoming TCP connections and Xray connects to the selected outbound. Add nodes from share links, manual settings or Xray outbound JSON. Supported protocols include VLESS, VMess, Shadowsocks, Trojan, Hysteria2 and SOCKS.
 
-- Real data plane backed by HAProxy and sing-box—no simulated routing or health results
-- Unlimited proxy groups, each with its own listen address and port
-- Load balancing, failover, lowest-latency, and fixed-node policies
-- Weighted least-connections, weighted round-robin, and weighted-random algorithms
-- Real HTTP/HTTPS checks through every node's dedicated sing-box SOCKS adapter
-- Configurable check URLs, intervals, timeouts, failure/recovery thresholds, and latency tolerance
-- Manual forms, sing-box/Xray outbound JSON, and share-link imports
-- VLESS, VMess, Shadowsocks, Trojan, Hysteria2, and SOCKS support
-- Encrypted node credentials stored locally with AES-256-GCM
-- Live bidirectional throughput, active connections, per-port totals, and 30-minute to 7-day trends
-- Searchable HAProxy, sing-box, control-plane, and configuration event logs
-- Configurable one-second to 60-second sampling and data-retention policies
-- English by default, with Simplified Chinese, Japanese, French, and Korean interfaces
-- Responsive web dashboard with server-persisted settings
-- Docker image support for `linux/amd64` and `linux/arm64`
+Each group runs HTTP or HTTPS checks through its nodes. Its routing policy determines where new connections go.
 
-Built-in demonstration nodes use reserved `example.com` addresses and are disabled automatically. Add real node credentials before enabling traffic.
+| Policy | Node selection |
+| --- | --- |
+| Load balancing | Shares connections among healthy nodes using weighted least connections, round robin or random selection. |
+| Failover | Uses the healthy node with the lowest priority number. |
+| Lowest latency | Prefers the fastest healthy node and switches when the improvement exceeds the configured tolerance. |
+| Fixed node | Uses one node you choose. |
 
-## Architecture
+The dashboard shows active connections and traffic history per listener, along with health-check results and runtime logs.
 
-```text
-Client :1188 ─┐                         ┌─ VLESS node A
-Client :2288 ─┼─> HAProxy listeners ───┼─ Shadowsocks node B
-Client :3388 ─┘        │                └─ Trojan/Hysteria2 node C
-                       │
-                 KitsuneGate API
-                 ├─ health checks
-                 ├─ routing policy
-                 ├─ runtime reloads
-                 ├─ traffic samples
-                 └─ web dashboard
+## Run the published image
 
-Each HAProxy backend points to a dedicated local sing-box SOCKS adapter.
-```
+Use Docker Engine on Linux (AMD64 or ARM64). The image includes the dashboard, HAProxy and the outbound core. The v0.1.x images ship with sing-box. For Xray, choose a release that includes it or build this checkout from source.
 
-## Quick start with Docker Compose
+### Docker Compose
 
-Linux with Docker Engine and Docker Compose v2 is required. Host networking lets newly created proxy-group ports become available without editing the Compose file.
+In an empty directory, download the project's [Compose file](docker-compose.yml).
 
 ```bash
-git clone https://github.com/touka2014/kitsunegate.git
-cd kitsunegate
-cp .env.example .env
+curl -fsSLO https://raw.githubusercontent.com/touka2014/kitsunegate/main/docker-compose.yml
 ```
 
-Edit `.env` and set a strong password. The default command pulls the official prebuilt image and starts it:
+Create a file named `.env` alongside it. Add `KITSUNEGATE_ADMIN_PASSWORD=` followed by a unique dashboard password. The default username is `kitsunegate`. Compose pulls `latest` by default. To pin a release, set `KITSUNEGATE_IMAGE` in the same file to its full image reference, such as `ghcr.io/touka2014/kitsunegate:0.1.1`.
 
 ```bash
-docker compose up -d
-docker compose ps
-docker compose logs -f kitsunegate
+docker compose pull
+docker compose up -d --no-build
 ```
 
-Open `http://SERVER_IP:8080` and sign in with the credentials from `.env`. Proxy clients connect to `SERVER_IP:GROUP_PORT`, such as `SERVER_IP:1188`.
+### Docker CLI
 
-To force a build from the checked-out source instead:
+To start the same image with `docker run`, create the password file `.env` as described above and run the following command. Docker pulls the image if it is missing.
+
+```bash
+docker run -d --name kitsunegate --restart unless-stopped \
+  --network host --env-file .env \
+  -v "$PWD/deployment-data:/app/data" \
+  ghcr.io/touka2014/kitsunegate:latest
+```
+
+### Connect a client
+
+Open `http://<server-host>:8080` and sign in. Add an outbound node to a group and run a health check. Set your client's SOCKS5 proxy to the group's reachable address and listener port. Host networking makes each group port available directly on the Linux host.
+
+Restrict the dashboard to administrators and the SOCKS5 ports to trusted clients. The dashboard password protects the management interface. Use HTTPS when accessing it over an untrusted network.
+
+## Build from source
+
+From a checkout with your dashboard password set in `.env`, build and start a local image with the repository's Compose file.
 
 ```bash
 KITSUNEGATE_IMAGE=kitsunegate:local docker compose up -d --build
 ```
 
-## Configuration
+For local development, use Node.js 24 and run the following in the checkout. The core installer supports Windows x64 and Linux x64/arm64. On Linux it requires `unzip`.
 
-| Variable                     | Default                                | Purpose                                                               |
-| ---------------------------- | -------------------------------------- | --------------------------------------------------------------------- |
-| `KITSUNEGATE_IMAGE`          | `ghcr.io/touka2014/kitsunegate:latest` | Container image; override with `kitsunegate:local` for a source build |
-| `KITSUNEGATE_WEB_ORIGIN`     | `http://localhost:8080`                | Browser origin allowed by the management API                          |
-| `KITSUNEGATE_ADMIN_USER`     | `kitsunegate`                          | HTTP Basic Authentication username                                    |
-| `KITSUNEGATE_ADMIN_PASSWORD` | none                                   | Required management password                                          |
-| `KITSUNEGATE_DATA_DIR`       | `/app/data` in Docker                  | SQLite database and credential key location                           |
-| `KITSUNEGATE_RUNTIME_DIR`    | `/app/runtime` in Docker               | Generated HAProxy and sing-box configuration                          |
-| `KITSUNEGATE_SECRET`         | generated locally                      | Optional stable secret used to derive the credential-encryption key   |
-| `KITSUNEGATE_BALANCER`       | `haproxy` in Docker                    | Set to `builtin` only when HAProxy is unavailable                     |
-
-Keep `deployment-data/` and `.env` out of version control. Back up the database and `.secret` together; encrypted node credentials cannot be recovered without the matching secret.
-
-## Local development
-
-Node.js `22.13+` is required; Node.js 24 is recommended.
-
-```powershell
-npm install
+```bash
+npm ci
 npm run core:install
 npm run dev
 ```
 
-Open `http://localhost:3000` and sign in as `kitsunegate`. For local development the first start generates a password in `data/.admin-password`. You can instead set `KITSUNEGATE_ADMIN_USER` and `KITSUNEGATE_ADMIN_PASSWORD` before starting. The local API binds to `127.0.0.1:8787` and requires the same credentials. In Docker, Nginx reaches the API through a private Unix socket. `/readyz` returns HTTP 503 when the data plane is unavailable. API clients must send `Content-Type: application/json` on writes. Windows uses KitsuneGate's built-in TCP balancer because HAProxy does not provide an official native Windows distribution; sing-box still carries real proxy traffic and health checks.
-
-Test a listener with:
-
-```powershell
-curl.exe --proxy socks5h://127.0.0.1:1188 https://www.gstatic.com/generate_204
-```
-
-Health-check targets accept one URL per line, optionally followed by a space and an expected HTTP status, e.g. `https://example.org/check 204`. The default is 204 for `/generate_204` and any 2xx response elsewhere. Testing draft settings leaves saved health counters and routing untouched.
+Open `http://localhost:3000` and sign in as `kitsunegate`. The local API writes a generated password to `data/.admin-password` unless you supply `KITSUNEGATE_ADMIN_PASSWORD` in its environment.
 
 ## Data and upgrades
 
-- `data/kitsunegate.db`: groups, nodes, settings, events, logs, and traffic samples
-- `data/.secret`: local credential-encryption key
-- `runtime/bin/sing-box.exe`: Windows core installed by `npm run core:install`
-- `runtime/generated/`: active HAProxy and sing-box configurations
+Both container examples store the database and its credential-encryption key in `./deployment-data`. Before upgrading, stop the container and back up that directory together with any custom `KITSUNEGATE_SECRET`. For a Compose installation, run the pull and start commands above from the same directory after selecting the image tag you want.
 
-Existing RelayDeck installations are migrated in place: `relaydeck.db` is renamed to `kitsunegate.db`, and legacy `RELAYDECK_*` environment variables remain accepted for the transition. User-created groups, nodes, statistics, and encryption keys are preserved.
+When moving from v0.1.x to Xray, allow a maintenance window for the first start. KitsuneGate validates existing nodes. If a node cannot be migrated, you can see the reason in its event history and edit its saved configuration.
 
-## Validation
-
-```bash
-npm run lint
-npm test
-npm run build
-docker compose build
-```
-
-The container build runs linting, automated tests, and the production web build before producing an image.
-
-## Publishing images
-
-The included GitHub Actions workflow publishes multi-platform images to GitHub Container Registry whenever a semantic version tag is pushed:
-
-```bash
-git tag -a v0.1.0 -m "KitsuneGate v0.1.0 — First Tail"
-git push origin v0.1.0
-```
-
-It publishes the following image tags:
-
-```text
-ghcr.io/touka2014/kitsunegate:0.1.0
-ghcr.io/touka2014/kitsunegate:0.1
-ghcr.io/touka2014/kitsunegate:latest
-```
-
-The workflow generates an SBOM, build provenance, and `amd64`/`arm64` manifests, then creates the matching GitHub Release. Add curated notes at `docs/releases/<tag>.md`; when that file is absent, GitHub-generated notes are used instead. No Docker Hub account is required.
-
-After the first tagged build, open the package settings on GitHub and set the container package visibility to **Public**. This lets users pull the image without signing in to GHCR.
-
-KitsuneGate keeps machine-readable SemVer tags and gives each GitHub Release an artistic codename. The first planned release is `v0.1.0 — First Tail`; later codenames can follow the nine-tailed fox motif without changing normal version ordering or image tags.
-
-## Security
-
-- Do not expose port `8080` over the public internet without HTTPS.
-- Restrict the management port by firewall or private network.
-- Use a unique, high-entropy management password.
-- Never commit `.env`, `deployment-data/`, `data/`, database files, or `.secret`.
-- Review imported outbound JSON before saving it.
+Branch pushes build a test image for CI. Pushing a version tag such as `v0.2.0` triggers publication of the AMD64 and ARM64 images to GHCR and creates the GitHub Release. [Published releases](https://github.com/touka2014/kitsunegate/releases) · [Release workflow](.github/workflows/container.yml)
 
 ## License
 
-KitsuneGate is released under the [MIT License](LICENSE).
+KitsuneGate is an independent project distributed under the [MIT License](LICENSE).

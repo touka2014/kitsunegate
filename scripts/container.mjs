@@ -13,19 +13,25 @@ if (!adminPassword)
   throw new Error(
     'KITSUNEGATE_ADMIN_PASSWORD is required; refusing to start an unprotected dashboard.',
   );
-const passwordHash = execFileSync('openssl', ['passwd', '-6', adminPassword], {
+const webGroup = Number(
+  execFileSync('id', ['-g', 'www-data'], { encoding: 'utf8' }).trim(),
+);
+const passwordFile = '/run/kitsunegate/nginx.htpasswd';
+const passwordHash = execFileSync('openssl', ['passwd', '-6', '-stdin'], {
+  input: adminPassword + '\n',
   encoding: 'utf8',
 }).trim();
-fs.writeFileSync(
-  '/run/kitsunegate/nginx.htpasswd',
-  `${adminUser}:${passwordHash}\n`,
-  { mode: 0o600 },
-);
+fs.writeFileSync(passwordFile, `${adminUser}:${passwordHash}\n`, {
+  mode: 0o600,
+});
+
+fs.chownSync(passwordFile, process.getuid(), webGroup);
+fs.chmodSync(passwordFile, 0o640);
 
 const children = [
   spawn(process.execPath, ['server/index.mjs'], {
     stdio: 'inherit',
-    env: process.env,
+    env: { ...process.env, KITSUNEGATE_WEB_GID: String(webGroup) },
   }),
   spawn(process.execPath, ['dist/standalone/server.js'], {
     stdio: 'inherit',

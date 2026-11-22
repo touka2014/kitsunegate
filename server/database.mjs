@@ -6,7 +6,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { probeOptions } from './probes.mjs';
 import { decryptSecret, encryptSecret, maskProxyUri } from './crypto.mjs';
 import {
-  linkToSingBox,
+  parseShareLink,
+  savedManualConfig,
   normalizeJsonConfig,
   normalizeManualConfig,
 } from './node-config.mjs';
@@ -189,95 +190,21 @@ const now = () => new Date().toISOString();
 const createId = (prefix) =>
   `${prefix}_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`;
 
-function parseProxyUri(uri) {
-  const trimmed = String(uri ?? '').trim();
-  const match = trimmed.match(/^([a-zA-Z0-9+.-]+):\/\//);
-  if (!match)
-    throw new Error(
-      'Node link must begin with vless://, ss://, trojan://, hysteria2://, or socks://.',
-    );
-  const protocol = match[1].toLowerCase();
-  const supported = new Set([
-    'vless',
-    'vmess',
-    'ss',
-    'trojan',
-    'hysteria2',
-    'hy2',
-    'socks',
-    'socks5',
-  ]);
-  if (!supported.has(protocol))
-    throw new Error(`Protocol ${protocol} is not supported.`);
-
-  let server = '';
-  let serverPort = 443;
-  if (protocol === 'vmess') {
-    try {
-      const raw = Buffer.from(
-        trimmed.slice('vmess://'.length).split('#')[0],
-        'base64',
-      ).toString('utf8');
-      const config = JSON.parse(raw);
-      server = config.add;
-      serverPort = Number(config.port);
-    } catch {
-      throw new Error('The VMess link is invalid.');
-    }
-  } else if (protocol === 'ss') {
-    const withoutHash = trimmed.split('#')[0];
-    const at = withoutHash.lastIndexOf('@');
-    if (at > -1) {
-      const hostPart = withoutHash.slice(at + 1);
-      const parsed = new URL(`tcp://${hostPart}`);
-      server = parsed.hostname;
-      serverPort = Number(parsed.port || 8388);
-    } else {
-      try {
-        const decoded = Buffer.from(withoutHash.slice(5), 'base64').toString(
-          'utf8',
-        );
-        const hostPort = decoded.split('@').pop();
-        const parsed = new URL(`tcp://${hostPort}`);
-        server = parsed.hostname;
-        serverPort = Number(parsed.port || 8388);
-      } catch {
-        throw new Error('The Shadowsocks link is invalid.');
-      }
-    }
-  } else {
-    const parsed = new URL(trimmed);
-    server = parsed.hostname;
-    serverPort = Number(parsed.port || 443);
-  }
-
-  if (
-    !server ||
-    !Number.isInteger(serverPort) ||
-    serverPort < 1 ||
-    serverPort > 65535
-  ) {
-    throw new Error('The node server address or port is invalid.');
-  }
-  const label = decodeURIComponent(trimmed.split('#')[1] ?? '').trim();
-  return {
-    protocol:
-      protocol === 'hy2'
-        ? 'hysteria2'
-        : protocol === 'socks5'
-          ? 'socks'
-          : protocol,
-    server,
-    serverPort,
-    label,
-  };
-}
-
 function nextAdapterPort() {
   const row = db
     .prepare('SELECT MAX(adapter_port) AS max_port FROM proxy_nodes')
     .get();
-  return Math.max(12000, Number(row?.max_port ?? 12000)) + 1;
+  const next = Math.max(12000, Number(row?.max_port ?? 12000)) + 1;
+  if (next <= 65535) return next;
+  const occupied = new Set(
+    db
+      .prepare('SELECT adapter_port FROM proxy_nodes')
+      .all()
+      .map((n) => n.adapter_port),
+  );
+  for (let port = 12001; port <= 65535; port++)
+    if (!occupied.has(port)) return port;
+  throw new Error('Node adapter port limit reached.');
 }
 
 function addEvent({
@@ -333,7 +260,7 @@ function insertGroup(group) {
   return id;
 }
 
-function prepareNodeInput(input, fallbackSource = 'link') {
+function prepareNodeInput(input) {
   const sourceType = ['link', 'manual', 'json'].includes(input.sourceType)
     ? input.sourceType
     : input.manual
@@ -352,7 +279,9 @@ function prepareNodeInput(input, fallbackSource = 'link') {
       serverPort: config.serverPort,
       label: '',
     };
-    encryptedConfig = encryptSecret(JSON.stringify({ kind: 'manual', config }));
+    encryptedConfig = encryptSecret(
+      JSON.stringify({ kind: 'manual', core: 'xray', config }),
+    );
   } else if (sourceType === 'json') {
     const normalized = normalizeJsonConfig(input.json);
     parsed = {
@@ -363,20 +292,26 @@ function prepareNodeInput(input, fallbackSource = 'link') {
     };
     encryptedConfig = encryptSecret(JSON.stringify(normalized.payload));
   } else {
-    const outbound = linkToSingBox(input.uri, 'validate');
-    parsed = {
-      ...parseProxyUri(input.uri),
-      server: outbound.server,
-      serverPort: outbound.server_port,
-    };
-    encryptedUri = encryptSecret(input.uri);
+    const { config, label, uri } = parseShareLink(input.uri);
+    parsed = { ...config, label };
+    encryptedUri = encryptSecret(uri);
   }
   return {
-    sourceType: sourceType || fallbackSource,
+    sourceType,
     parsed,
     encryptedUri,
     encryptedConfig,
   };
+}
+
+function nodeRoutingValues(weight, priority) {
+  weight = Number(weight);
+  priority = Number(priority);
+  if (!Number.isInteger(weight) || weight < 1 || weight > 256)
+    throw new Error('Node weight must be between 1 and 256.');
+  if (!Number.isSafeInteger(priority) || priority < 1)
+    throw new Error('Node priority must be a positive integer.');
+  return { weight, priority };
 }
 
 function insertNode(groupId, input) {
@@ -389,6 +324,10 @@ function insertNode(groupId, input) {
       'SELECT COALESCE(MAX(priority), 0) + 1 AS priority FROM proxy_nodes WHERE group_id = ?',
     )
     .get(groupId);
+  const { weight, priority } = nodeRoutingValues(
+    input.weight ?? 5,
+    input.priority ?? priorityRow.priority,
+  );
   db.prepare(`
     INSERT INTO proxy_nodes (
       id, group_id, name, protocol, server, server_port, encrypted_uri,
@@ -408,8 +347,8 @@ function insertNode(groupId, input) {
     sourceType,
     encryptedConfig,
     Number(input.adapterPort ?? nextAdapterPort()),
-    Number(input.weight ?? 5),
-    Number(input.priority ?? priorityRow.priority),
+    weight,
+    priority,
     input.enabled === false ? 0 : 1,
     input.healthStatus ?? 'unknown',
     input.latencyMs ?? null,
@@ -631,37 +570,33 @@ db.exec(`
   ) AND server LIKE '%.example.com'
 `);
 
-// v0.1.0 accepted links it could not render and silently skipped their adapters.
-if (
-  !db
-    .prepare("SELECT 1 FROM app_settings WHERE key='validatedLegacyLinks'")
-    .get()
-) {
+// The original encrypted records remain editable, including nodes excluded during upgrade.
+export function needsXrayMigration() {
+  return !db
+    .prepare("SELECT 1 FROM app_settings WHERE key='xrayMigration1'")
+    .get();
+}
+
+export function finishXrayMigration(rejected) {
   db.exec('BEGIN');
   try {
-    for (const row of db
-      .prepare(
-        "SELECT id,group_id,encrypted_uri FROM proxy_nodes WHERE enabled=1 AND source_type='link'",
-      )
-      .all()) {
-      const uri = decryptSecret(row.encrypted_uri);
-      try {
-        linkToSingBox(uri, 'validate');
-      } catch (error) {
-        db.prepare(
-          "UPDATE proxy_nodes SET enabled=0,health_status='unknown',last_error=? WHERE id=?",
-        ).run(error.message, row.id);
-        addEvent({
-          groupId: row.group_id,
-          nodeId: row.id,
-          type: 'node.invalid',
-          severity: 'error',
-          message: 'Disabled invalid saved link: ' + error.message,
-        });
-      }
+    db.exec(
+      "UPDATE proxy_nodes SET health_status='unknown', latency_ms=NULL, consecutive_failure=0, consecutive_success=0, last_checked_at=NULL, last_error=NULL WHERE enabled=1",
+    );
+    for (const { node, reason } of rejected) {
+      db.prepare(
+        'UPDATE proxy_nodes SET enabled=0,last_error=? WHERE id=?',
+      ).run(reason, node.id);
+      addEvent({
+        groupId: node.group_id,
+        nodeId: node.id,
+        type: 'node.migration',
+        severity: 'warning',
+        message: 'Disabled ' + node.name + ' during Xray upgrade: ' + reason,
+      });
     }
     db.prepare(
-      "INSERT INTO app_settings(key,value,updated_at) VALUES('validatedLegacyLinks','true',?)",
+      "INSERT INTO app_settings(key,value,updated_at) VALUES('xrayMigration1','true',?)",
     ).run(now());
     db.exec('COMMIT');
   } catch (error) {
@@ -757,7 +692,7 @@ export function getState() {
         process.env.RELAYDECK_ENGINE_MODE ??
         'real',
       haproxy: false,
-      singbox: false,
+      xray: false,
       lastAppliedAt: null,
     },
     groups,
@@ -773,8 +708,8 @@ function validateGroup(input, existingId = null) {
     .slice(0, 4);
   const listenHost = String(input.listenHost ?? '0.0.0.0').trim();
   const listenPort = Number(input.listenPort);
-  if (!name) throw new Error('Enter a proxy group name.');
-  if (!regionCode) throw new Error('Enter a region code.');
+  if (!name) throw new Error('Proxy group name is required.');
+  if (!regionCode) throw new Error('Region code is required.');
   if (!/^[a-zA-Z0-9.:%_-]+$/.test(listenHost))
     throw new Error('Invalid listen address.');
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535)
@@ -786,13 +721,24 @@ function validateGroup(input, existingId = null) {
     throw new Error(
       `${listenHost}:${listenPort} is already used by another proxy group.`,
     );
-  const probeUrls = Array.isArray(input.probeUrls)
-    ? input.probeUrls
-        .map(String)
-        .map((url) => url.trim())
-        .filter(Boolean)
-    : ['https://www.gstatic.com/generate_204'];
-  probeOptions(probeUrls, Number(input.probeTimeout ?? 6));
+  const mode = input.mode ?? 'load_balance';
+  const algorithm = input.algorithm ?? 'leastconn';
+  if (!['load_balance', 'fallback', 'latency_best', 'fixed'].includes(mode))
+    throw new Error('Invalid routing mode.');
+  if (!['leastconn', 'roundrobin', 'random'].includes(algorithm))
+    throw new Error('Invalid load-balancing algorithm.');
+  if (
+    input.selectedNodeId &&
+    (!existingId ||
+      !db
+        .prepare('SELECT 1 FROM proxy_nodes WHERE id = ? AND group_id = ?')
+        .get(input.selectedNodeId, existingId))
+  )
+    throw new Error('Invalid selected node for this proxy group.');
+  const { probe_urls: probeUrls } = probeOptions(
+    input.probeUrls ?? ['https://www.gstatic.com/generate_204'],
+    Number(input.probeTimeout ?? 6),
+  );
   function bounded(name, value, fallback, minimum, maximum) {
     const number = Number(value ?? fallback);
     if (!Number.isInteger(number) || number < minimum || number > maximum)
@@ -805,14 +751,8 @@ function validateGroup(input, existingId = null) {
     regionCode,
     listenHost,
     listenPort,
-    mode: ['load_balance', 'fallback', 'latency_best', 'fixed'].includes(
-      input.mode,
-    )
-      ? input.mode
-      : 'load_balance',
-    algorithm: ['leastconn', 'roundrobin', 'random'].includes(input.algorithm)
-      ? input.algorithm
-      : 'leastconn',
+    mode,
+    algorithm,
     probeUrls,
     probeInterval: bounded('Probe interval', input.probeInterval, 15, 5, 3600),
     probeTimeout: bounded('Probe timeout', input.probeTimeout, 6, 1, 60),
@@ -846,6 +786,7 @@ export function updateGroup(id, input) {
     listenPort: input.listenPort ?? current.listen_port,
     mode: input.mode ?? current.mode,
     algorithm: input.algorithm ?? current.algorithm,
+    selectedNodeId: input.selectedNodeId,
     probeUrls: input.probeUrls ?? JSON.parse(current.probe_urls),
     probeInterval: input.probeInterval ?? current.probe_interval,
     probeTimeout: input.probeTimeout ?? current.probe_timeout,
@@ -854,13 +795,18 @@ export function updateGroup(id, input) {
     latencyTolerance: input.latencyTolerance ?? current.latency_tolerance,
   };
   const group = validateGroup(merged, id);
-  if (
-    input.selectedNodeId &&
-    !db
-      .prepare('SELECT 1 FROM proxy_nodes WHERE id = ? AND group_id = ?')
-      .get(input.selectedNodeId, id)
-  )
-    throw new Error('The selected node does not belong to this proxy group.');
+  let selectedNodeId =
+    input.selectedNodeId === undefined
+      ? current.selected_node_id
+      : input.selectedNodeId || null;
+  if (group.mode === 'fixed' && current.mode !== 'fixed' && !selectedNodeId) {
+    const first = db
+      .prepare(
+        'SELECT id FROM proxy_nodes WHERE group_id = ? AND enabled = 1 ORDER BY priority, created_at LIMIT 1',
+      )
+      .get(id);
+    selectedNodeId = first?.id ?? null;
+  }
   db.prepare(`
     UPDATE proxy_groups SET
       name = ?, region_code = ?, listen_host = ?, listen_port = ?, mode = ?,
@@ -875,7 +821,7 @@ export function updateGroup(id, input) {
     group.listenPort,
     group.mode,
     group.algorithm,
-    input.selectedNodeId ?? current.selected_node_id,
+    selectedNodeId,
     input.enabled === undefined ? current.enabled : input.enabled ? 1 : 0,
     JSON.stringify(group.probeUrls),
     group.probeInterval,
@@ -957,7 +903,7 @@ export function getNodeConfig(id) {
     result.uri = decryptSecret(node.encrypted_uri);
   } else {
     const stored = JSON.parse(decryptSecret(node.encrypted_config));
-    if (sourceType === 'manual') result.manual = stored.config;
+    if (sourceType === 'manual') result.manual = savedManualConfig(stored);
     if (sourceType === 'json')
       result.json = JSON.stringify(
         stored.original ?? stored.outbound ?? stored.config,
@@ -980,18 +926,18 @@ export function updateNode(id, input) {
   let sourceType = current.source_type ?? 'link';
   let encryptedConfig = current.encrypted_config;
   if (input.sourceType || input.uri || input.manual || input.json) {
-    const prepared = prepareNodeInput(input, sourceType);
+    const prepared = prepareNodeInput(input);
     parsed = prepared.parsed;
     encryptedUri = prepared.encryptedUri;
     sourceType = prepared.sourceType;
     encryptedConfig = prepared.encryptedConfig;
   }
   const name = String(input.name ?? current.name).trim();
-  const weight = Number(input.weight ?? current.weight);
-  const priority = Number(input.priority ?? current.priority);
-  if (!name) throw new Error('Enter a node name.');
-  if (!Number.isInteger(weight) || weight < 1 || weight > 256)
-    throw new Error('Node weight must be between 1 and 256.');
+  const { weight, priority } = nodeRoutingValues(
+    input.weight ?? current.weight,
+    input.priority ?? current.priority,
+  );
+  if (!name) throw new Error('Node name is required.');
   db.prepare(`
     UPDATE proxy_nodes SET
       name = ?, protocol = ?, server = ?, server_port = ?, encrypted_uri = ?,
@@ -1011,6 +957,19 @@ export function updateNode(id, input) {
     now(),
     id,
   );
+  const changed =
+    sourceType !== current.source_type ||
+    (input.enabled !== undefined &&
+      Boolean(input.enabled) !== Boolean(current.enabled)) ||
+    (encryptedConfig !== current.encrypted_config &&
+      decryptSecret(encryptedConfig) !==
+        decryptSecret(current.encrypted_config)) ||
+    (encryptedUri !== current.encrypted_uri &&
+      decryptSecret(encryptedUri) !== decryptSecret(current.encrypted_uri));
+  if (changed)
+    db.prepare(
+      "UPDATE proxy_nodes SET health_status='unknown', latency_ms=NULL, last_checked_at=NULL, last_error=NULL, consecutive_success=0, consecutive_failure=0 WHERE id=?",
+    ).run(id);
   addEvent({
     groupId: current.group_id,
     nodeId: id,
@@ -1025,6 +984,9 @@ export function deleteNode(id) {
     .prepare('SELECT group_id, name FROM proxy_nodes WHERE id = ?')
     .get(id);
   if (!node) throw new Error('Node not found.');
+  db.prepare(
+    'UPDATE proxy_groups SET selected_node_id=NULL WHERE selected_node_id=?',
+  ).run(id);
   db.prepare('DELETE FROM proxy_nodes WHERE id = ?').run(id);
   addEvent({
     groupId: node.group_id,
@@ -1271,6 +1233,20 @@ export function getLatestTrafficTotals(groupId) {
       totalConnections: 0,
     }
   );
+}
+
+export function getRoutingGroups(id) {
+  const groups = id
+    ? db.prepare('SELECT * FROM proxy_groups WHERE id=?').all(id)
+    : db.prepare('SELECT * FROM proxy_groups ORDER BY created_at').all();
+  const nodes =
+    db.prepare(`SELECT id,name,enabled,adapter_port,priority,weight,latency_ms,health_status
+    FROM proxy_nodes WHERE group_id=? ORDER BY priority,created_at`);
+  return groups.map((group) => ({
+    ...group,
+    probe_urls: JSON.parse(group.probe_urls),
+    nodes: nodes.all(group.id),
+  }));
 }
 
 export function getRawStateForEngine() {

@@ -1,4 +1,4 @@
-import { linkToSingBox, manualToSingBox } from './node-config.mjs';
+import { nodeOutbound } from './node-config.mjs';
 
 function escapeName(value) {
   return String(value).replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -54,56 +54,35 @@ export function renderHAProxyConfig(groups, options = {}) {
   return lines.join('\n');
 }
 
-function parseSimpleUri(node) {
-  if (node.stored_config?.kind === 'singbox') {
-    return { ...node.stored_config.outbound, tag: `out-${node.id}` };
-  }
-  if (node.stored_config?.kind === 'manual') {
-    return manualToSingBox(node.stored_config.config, `out-${node.id}`);
-  }
-  try {
-    return linkToSingBox(node.uri, `out-${node.id}`);
-  } catch (error) {
-    throw new Error(
-      `${node.name || node.id}: ${error instanceof Error ? error.message : 'Failed to parse the share link'}`,
-    );
-  }
-}
-
-export function renderSingBoxConfig(groups, options = {}) {
+export function renderXrayConfig(groups, options = {}) {
   const nodes = groups
     .filter((group) => group.enabled)
-    .flatMap((group) => group.nodes)
-    .filter((node) => node.enabled);
-  const parsedNodes = nodes.map((node) => ({
-    node,
-    outbound: parseSimpleUri(node),
-  }));
+    .flatMap((group) => group.nodes.filter((node) => node.enabled));
   return JSON.stringify(
     {
-      $schema: 'https://sing-box.sagernet.org/schema.json',
-      log: {
-        level:
-          options.logLevel === 'warning'
-            ? 'warn'
-            : (options.logLevel ?? 'info'),
-        timestamp: true,
-      },
-      inbounds: parsedNodes.map(({ node }) => ({
-        type: 'socks',
-        tag: `in-${node.id}`,
+      log: { loglevel: options.logLevel ?? 'info', access: 'none' },
+      inbounds: nodes.map((node) => ({
+        tag: 'in-' + node.id,
+        protocol: 'socks',
         listen: '127.0.0.1',
-        listen_port: node.adapter_port,
+        port: node.adapter_port,
+        settings: { auth: 'noauth', udp: false },
       })),
       outbounds: [
-        ...parsedNodes.map(({ outbound }) => outbound),
-        { type: 'direct', tag: 'direct' },
+        { protocol: 'blackhole', tag: 'unrouted' },
+        ...nodes.map((node) => {
+          try {
+            return nodeOutbound(node);
+          } catch (error) {
+            throw new Error(node.name + ': ' + error.message);
+          }
+        }),
       ],
-      route: {
-        rules: parsedNodes.map(({ node }) => ({
-          inbound: [`in-${node.id}`],
-          action: 'route',
-          outbound: `out-${node.id}`,
+      routing: {
+        rules: nodes.map((node) => ({
+          type: 'field',
+          inboundTag: ['in-' + node.id],
+          outboundTag: 'out-' + node.id,
         })),
       },
     },
